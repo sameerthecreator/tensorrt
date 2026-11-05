@@ -13,30 +13,15 @@ jobs:
     - name: Checkout Repository
       uses: actions/checkout@v4
 
-    - name: Create Required Folders
-      shell: pwsh
-      run: |
-        New-Item -ItemType Directory -Force -Path "include/crt"
-
     - name: Download Official ReShade Headers
       shell: pwsh
       run: |
+        New-Item -ItemType Directory -Force -Path "include"
         Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade.hpp" -OutFile "include/reshade.hpp"
         Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_api.hpp" -OutFile "include/reshade_api.hpp"
         Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_api_device.hpp" -OutFile "include/reshade_api_device.hpp"
         Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_api_pipeline.hpp" -OutFile "include/reshade_api_pipeline.hpp"
         Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_api_resource.hpp" -OutFile "include/reshade_api_resource.hpp"
-
-    - name: Fix CUDA Header Directory Structure
-      shell: pwsh
-      run: |
-        $filesToMove = @("host_defines.h", "host_config.h")
-        foreach ($file in $filesToMove) {
-            if (Test-Path "include/$file") {
-                Move-Item -Force "include/$file" "include/crt/$file"
-                Write-Host "Moved $file to include/crt/$file"
-            }
-        }
 
     - name: Set up MSVC Developer Command Prompt
       uses: ilammy/msvc-dev-cmd@v1
