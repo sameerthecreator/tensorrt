@@ -25,7 +25,6 @@ const int IN_W = 768;
 const int IN_H = 432;
 const int IN_C = 7;
 
-// Load pre-compiled sharp.engine
 void init_tensorrt() {
     std::ifstream file("sharp.engine", std::ios::binary);
     if (!file.good()) return;
@@ -50,15 +49,10 @@ void init_tensorrt() {
     g_context->setTensorAddress("rendered_frame", d_output);
 }
 
-// Hook ReShade Present Call
 static void on_present(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain) {
     if (!g_context) return;
-
-    // 1. Enqueue TensorRT async inference on GPU stream
     g_context->enqueueV3(g_stream);
     cudaStreamSynchronize(g_stream);
-
-    // 2. Output is ready in d_output for the swapchain render target
 }
 
 extern "C" __declspec(dllexport) const char* NAME = "NeuralRR TensorRT Addon";
@@ -83,4 +77,3 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID) {
     }
     return TRUE;
 }
-
