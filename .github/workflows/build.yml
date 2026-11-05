@@ -13,19 +13,13 @@ jobs:
     - name: Checkout Repository
       uses: actions/checkout@v4
 
-    - name: Download and Extract Official ReShade Headers
+    - name: Clone Official ReShade Headers
       shell: pwsh
       run: |
-        $zipUrl = "https://github.com/crosire/reshade/archive/refs/heads/main.zip"
-        Invoke-WebRequest -Uri $zipUrl -OutFile "reshade_src.zip"
-        Expand-Archive -Path "reshade_src.zip" -DestinationPath "reshade_temp"
-        
-        # Move the official include folder into your workspace root
-        Move-Item -Force -Path "reshade_temp/reshade-main/include" -Destination "include"
-        
-        # Clean up zip and temp files
-        Remove-Item -Recurse -Force "reshade_temp"
-        Remove-Item -Force "reshade_src.zip"
+        git clone --depth 1 https://github.com/crosire/reshade.git reshade_repo
+        New-Item -ItemType Directory -Force -Path "include"
+        Copy-Item -Recurse -Force "reshade_repo/include/*" "include/"
+        Remove-Item -Recurse -Force "reshade_repo"
 
     - name: Set up MSVC Developer Command Prompt
       uses: ilammy/msvc-dev-cmd@v1
