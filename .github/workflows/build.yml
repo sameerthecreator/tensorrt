@@ -50,23 +50,20 @@ jobs:
             Set-Content $headerPath $content
         }
 
-    - name: Download CUDA and TensorRT Import Libraries via NuGet v3
+    - name: Download CUDA and TensorRT Import Libraries via dotnet
       shell: pwsh
       run: |
+        New-Item -ItemType Directory -Force -Path "lib_temp"
+        Set-Location "lib_temp"
+        dotnet new classlib --force
+        dotnet add package NVIDIA.CUDART.Redist --version 12.4.127
+        dotnet add package NVIDIA.TensorRT --version 10.3.0
+        Set-Location ".."
+        
+        # Copy all required .lib files into the lib/ folder
         New-Item -ItemType Directory -Force -Path "lib"
-        
-        # Download NVIDIA CUDART Redistributable via NuGet v3 flat container
-        Invoke-WebRequest -Uri "https://api.nuget.org/v3-flatcontainer/nvidia.cudart.redist/12.4.127/nvidia.cudart.redist.12.4.127.nupkg" -OutFile "cudart.nupkg"
-        Expand-Archive -Path "cudart.nupkg" -DestinationPath "cudart_ext"
-        Copy-Item -Force "cudart_ext/runtimes/win-x64/native/lib/x64/*.lib" "lib/"
-        
-        # Download NVIDIA TensorRT via NuGet v3 flat container
-        Invoke-WebRequest -Uri "https://api.nuget.org/v3-flatcontainer/nvidia.tensorrt/10.3.0/nvidia.tensorrt.10.3.0.nupkg" -OutFile "trt.nupkg"
-        Expand-Archive -Path "trt.nupkg" -DestinationPath "trt_ext"
-        Copy-Item -Force "trt_ext/lib/*.lib" "lib/"
-        
-        # Cleanup temp files
-        Remove-Item -Recurse -Force "cudart_ext", "trt_ext", "cudart.nupkg", "trt.nupkg"
+        Get-ChildItem -Path "lib_temp" -Recurse -Filter "*.lib" | Copy-Item -Destination "lib/" -Force
+        Remove-Item -Recurse -Force "lib_temp"
 
     - name: Set up MSVC Developer Command Prompt
       uses: ilammy/msvc-dev-cmd@v1
