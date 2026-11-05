@@ -7,7 +7,6 @@
 // Simple TensorRT Logger
 class Logger : public nvinfer1::ILogger {
     void log(Severity severity, const char* msg) noexcept override {
-        // Suppress verbose/info logs, catch warnings and errors
         if (severity <= Severity::kWARNING) {
             OutputDebugStringA("[NeuralRR] ");
             OutputDebugStringA(msg);
@@ -25,26 +24,24 @@ static nvinfer1::IExecutionContext* g_trtContext = nullptr;
 static void on_init_device(reshade::api::device* device) {
     OutputDebugStringA("[NeuralRR] Initializing TensorRT runtime...\n");
     
-    // Initialize TensorRT runtime
     g_trtRuntime = nvinfer1::createInferRuntime(g_logger);
     if (!g_trtRuntime) {
         OutputDebugStringA("[NeuralRR] Failed to create TensorRT runtime!\n");
     }
-    
-    // Note: Load your compiled .engine model weights here if desired
 }
 
 // ReShade Device Destruction Hook
 static void on_destroy_device(reshade::api::device* device) {
     OutputDebugStringA("[NeuralRR] Cleaning up TensorRT resources...\n");
     
-    if (g_trtContext) { g_trtContext->destroy(); g_trtContext = nullptr; }
-    if (g_trtEngine) { g_trtEngine->destroy(); g_trtEngine = nullptr; }
-    if (g_trtRuntime) { g_trtRuntime->destroy(); g_trtRuntime = nullptr; }
+    // Modern TensorRT uses standard C++ delete
+    delete g_trtContext; g_trtContext = nullptr;
+    delete g_trtEngine;  g_trtEngine = nullptr;
+    delete g_trtRuntime; g_trtRuntime = nullptr;
 }
 
-// ReShade Present Hook (called every frame right before swapping buffers)
-static void on_present(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain, const reshade::api::viewport* source_rect, const reshade::api::rect* dest_rect, uint32_t dirty_rect_count, const reshade::api::rect* dirty_rects) {
+// ReShade Present Hook (Corrected signature with rect*)
+static void on_present(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain, const reshade::api::rect* source_rect, const reshade::api::rect* dest_rect, uint32_t dirty_rect_count, const reshade::api::rect* dirty_rects) {
     // Insert your neural rendering pass or TensorRT inference execution here
 }
 
