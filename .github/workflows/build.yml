@@ -13,7 +13,7 @@ jobs:
     - name: Checkout Repository
       uses: actions/checkout@v4
 
-    - name: Download Official ReShade Headers
+    - name: Download ReShade & CUDA Headers
       shell: pwsh
       run: |
         New-Item -ItemType Directory -Force -Path "include"
@@ -22,6 +22,10 @@ jobs:
         Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_api_device.hpp" -OutFile "include/reshade_api_device.hpp"
         Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_api_pipeline.hpp" -OutFile "include/reshade_api_pipeline.hpp"
         Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_api_resource.hpp" -OutFile "include/reshade_api_resource.hpp"
+
+        # Download official NVIDIA CUDA Runtime headers & stubs package
+        Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/nvidia.cuda_runtime.redist" -OutFile "cuda_rt.zip"
+        Expand-Archive -Path "cuda_rt.zip" -DestinationPath "cuda_rt"
 
     - name: Set up MSVC Developer Command Prompt
       uses: ilammy/msvc-dev-cmd@v1
@@ -33,8 +37,11 @@ jobs:
       run: |
         cl.exe /O2 /LD /std:c++17 neuralrr_main.cpp ^
           /I"include" ^
+          /I"cuda_rt\build\native\include" ^
+          /I"trt\include" ^
           /link ^
-          /LIBPATH:"lib" ^
+          /LIBPATH:"cuda_rt\runtimes\win-x64\native" ^
+          /LIBPATH:"trt\lib" ^
           nvinfer.lib cudart.lib ^
           /OUT:neuralrr.addon64
 
@@ -43,4 +50,3 @@ jobs:
       with:
         name: neuralrr-addon64
         path: neuralrr.addon64
-
