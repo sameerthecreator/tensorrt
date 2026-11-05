@@ -13,19 +13,23 @@ jobs:
     - name: Checkout Repository
       uses: actions/checkout@v4
 
-    - name: Download ReShade & CUDA Headers
+    - name: Download Missing ReShade & CUDA Headers
       shell: pwsh
       run: |
-        New-Item -ItemType Directory -Force -Path "include"
+        # 1. Create folder for official CUDA runtime headers
+        New-Item -ItemType Directory -Force -Path "cuda_headers"
+
+        # 2. Download Official ReShade Headers directly into your existing include/ folder
         Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade.hpp" -OutFile "include/reshade.hpp"
         Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_api.hpp" -OutFile "include/reshade_api.hpp"
         Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_api_device.hpp" -OutFile "include/reshade_api_device.hpp"
         Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_api_pipeline.hpp" -OutFile "include/reshade_api_pipeline.hpp"
         Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_api_resource.hpp" -OutFile "include/reshade_api_resource.hpp"
 
-        # Download official NVIDIA CUDA Runtime headers & stubs package
-        Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/nvidia.cuda_runtime.redist" -OutFile "cuda_rt.zip"
-        Expand-Archive -Path "cuda_rt.zip" -DestinationPath "cuda_rt"
+        # 3. Download Official CUDA Runtime Headers from NVIDIA GitHub Mirror
+        Invoke-WebRequest -Uri "https://raw.githubusercontent.com/NVIDIA/cuda-samples/master/Common/cuda_runtime.h" -OutFile "cuda_headers/cuda_runtime.h"
+        Invoke-WebRequest -Uri "https://raw.githubusercontent.com/NVIDIA/cuda-samples/master/Common/vector_types.h" -OutFile "cuda_headers/vector_types.h"
+        Invoke-WebRequest -Uri "https://raw.githubusercontent.com/NVIDIA/cuda-samples/master/Common/driver_types.h" -OutFile "cuda_headers/driver_types.h"
 
     - name: Set up MSVC Developer Command Prompt
       uses: ilammy/msvc-dev-cmd@v1
@@ -37,11 +41,9 @@ jobs:
       run: |
         cl.exe /O2 /LD /std:c++17 neuralrr_main.cpp ^
           /I"include" ^
-          /I"cuda_rt\build\native\include" ^
-          /I"trt\include" ^
+          /I"cuda_headers" ^
           /link ^
-          /LIBPATH:"cuda_rt\runtimes\win-x64\native" ^
-          /LIBPATH:"trt\lib" ^
+          /LIBPATH:"lib" ^
           nvinfer.lib cudart.lib ^
           /OUT:neuralrr.addon64
 
