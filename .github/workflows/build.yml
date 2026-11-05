@@ -13,25 +13,18 @@ jobs:
     - name: Checkout Repository
       uses: actions/checkout@v4
 
-    - name: Download ReShade & CUDA Headers
+    - name: Download Official ReShade Headers
       shell: pwsh
       run: |
-        # 1. Download Official ReShade Headers into include/
+        # Ensure include/ folder exists
         New-Item -ItemType Directory -Force -Path "include"
+
+        # Download ReShade headers directly into include/
         Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade.hpp" -OutFile "include/reshade.hpp"
         Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_api.hpp" -OutFile "include/reshade_api.hpp"
         Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_api_device.hpp" -OutFile "include/reshade_api_device.hpp"
         Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_api_pipeline.hpp" -OutFile "include/reshade_api_pipeline.hpp"
         Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_api_resource.hpp" -OutFile "include/reshade_api_resource.hpp"
-
-        # 2. Fetch official CUDA Runtime headers via NuGet v3 API
-        $nugetPackage = "nvidia.cuda_runtime.redist"
-        $versions = (Invoke-RestMethod "https://api.nuget.org/v3-flatcontainer/$nugetPackage/index.json").versions
-        $latestVersion = $versions[-1]
-        
-        Write-Host "Downloading CUDA Runtime headers version $latestVersion..."
-        Invoke-WebRequest -Uri "https://api.nuget.org/v3-flatcontainer/$nugetPackage/$latestVersion/$nugetPackage.$latestVersion.nupkg" -OutFile "cuda_rt.nupkg"
-        Expand-Archive -Path "cuda_rt.nupkg" -DestinationPath "cuda_extracted"
 
     - name: Set up MSVC Developer Command Prompt
       uses: ilammy/msvc-dev-cmd@v1
@@ -43,7 +36,6 @@ jobs:
       run: |
         cl.exe /O2 /LD /std:c++17 neuralrr_main.cpp ^
           /I"include" ^
-          /I"cuda_extracted\build\native\include" ^
           /link ^
           /LIBPATH:"lib" ^
           nvinfer.lib cudart.lib ^
