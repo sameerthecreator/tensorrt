@@ -50,6 +50,24 @@ jobs:
             Set-Content $headerPath $content
         }
 
+    - name: Download CUDA and TensorRT Import Libraries
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Force -Path "lib"
+        
+        # Download NVIDIA CUDART Redistributable package from NuGet
+        Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/NVIDIA.CUDART.Redist/12.4.127" -OutFile "cudart.nupkg"
+        Expand-Archive -Path "cudart.nupkg" -DestinationPath "cudart_ext"
+        Copy-Item -Force "cudart_ext/runtimes/win-x64/native/lib/x64/*.lib" "lib/"
+        
+        # Download NVIDIA TensorRT Redistributable package from NuGet
+        Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/NVIDIA.TensorRT/10.3.0" -OutFile "trt.nupkg"
+        Expand-Archive -Path "trt.nupkg" -DestinationPath "trt_ext"
+        Copy-Item -Force "trt_ext/lib/*.lib" "lib/"
+        
+        # Cleanup temp files
+        Remove-Item -Recurse -Force "cudart_ext", "trt_ext", "cudart.nupkg", "trt.nupkg"
+
     - name: Set up MSVC Developer Command Prompt
       uses: ilammy/msvc-dev-cmd@v1
       with:
