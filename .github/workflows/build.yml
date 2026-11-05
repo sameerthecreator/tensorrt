@@ -50,18 +50,18 @@ jobs:
             Set-Content $headerPath $content
         }
 
-    - name: Download CUDA and TensorRT Import Libraries
+    - name: Download CUDA and TensorRT Import Libraries via NuGet v3
       shell: pwsh
       run: |
         New-Item -ItemType Directory -Force -Path "lib"
         
-        # Download NVIDIA CUDART Redistributable package from NuGet
-        Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/NVIDIA.CUDART.Redist/12.4.127" -OutFile "cudart.nupkg"
+        # Download NVIDIA CUDART Redistributable via NuGet v3 flat container
+        Invoke-WebRequest -Uri "https://api.nuget.org/v3-flatcontainer/nvidia.cudart.redist/12.4.127/nvidia.cudart.redist.12.4.127.nupkg" -OutFile "cudart.nupkg"
         Expand-Archive -Path "cudart.nupkg" -DestinationPath "cudart_ext"
         Copy-Item -Force "cudart_ext/runtimes/win-x64/native/lib/x64/*.lib" "lib/"
         
-        # Download NVIDIA TensorRT Redistributable package from NuGet
-        Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/NVIDIA.TensorRT/10.3.0" -OutFile "trt.nupkg"
+        # Download NVIDIA TensorRT via NuGet v3 flat container
+        Invoke-WebRequest -Uri "https://api.nuget.org/v3-flatcontainer/nvidia.tensorrt/10.3.0/nvidia.tensorrt.10.3.0.nupkg" -OutFile "trt.nupkg"
         Expand-Archive -Path "trt.nupkg" -DestinationPath "trt_ext"
         Copy-Item -Force "trt_ext/lib/*.lib" "lib/"
         
