@@ -1,0 +1,60 @@
+name: Build NeuralRR ReShade Addon
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Download Official ReShade Header
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Force -Path "include"
+        Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade.hpp" -OutFile "include/reshade.hpp"
+        Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_api.hpp" -OutFile "include/reshade_api.hpp"
+        Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_api_device.hpp" -OutFile "include/reshade_api_device.hpp"
+        Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_api_pipeline.hpp" -OutFile "include/reshade_api_pipeline.hpp"
+        Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_api_resource.hpp" -OutFile "include/reshade_api_resource.hpp"
+
+    - name: Install CUDA Toolkit
+      uses: Jimver/cuda-toolkit@v0.2.14
+      with:
+        cuda-version: '12.4.1'
+        method: 'network'
+
+    - name: Download & Extract TensorRT Headers & Libs
+      shell: pwsh
+      run: |
+        Invoke-WebRequest -Uri "https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.0.1/zip/TensorRT-10.0.1.6.Windows.win10.cuda-12.4.zip" -OutFile "trt.zip" -UserAgent "NativeHost" -TimeoutSec 600 -ErrorAction SilentlyContinue
+        Expand-Archive -Path "trt.zip" -DestinationPath "trt_extracted" -ErrorAction SilentlyContinue
+
+    - name: Set up MSVC Developer Command Prompt
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x64
+
+    - name: Compile ReShade Addon DLL
+      shell: cmd
+      run: |
+        cl.exe /O2 /LD /std:c++17 src/neuralrr_main.cpp ^
+          /I"include" ^
+          /I"%CUDA_PATH%\include" ^
+          /I"trt_extracted\TensorRT-10.0.1.6\include" ^
+          /link ^
+          /LIBPATH:"%CUDA_PATH%\lib\x64" ^
+          /LIBPATH:"trt_extracted\TensorRT-10.0.1.6\lib" ^
+          cudart.lib nvinfer.lib ^
+          /OUT:neuralrr.addon64
+
+    - name: Upload Compiled Binary
+      uses: actions/upload-artifact@v4
+      with:
+        name: neuralrr-addon64
+        path: neuralrr.addon64
