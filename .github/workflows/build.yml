@@ -31,7 +31,7 @@ jobs:
     - name: Compile ReShade Addon DLL
       shell: cmd
       run: |
-        cl.exe /O2 /LD /std:c++17 src/neuralrr_main.cpp ^
+        cl.exe /O2 /LD /std:c++17 neuralrr_main.cpp ^
           /I"include" ^
           /link ^
           /LIBPATH:"lib" ^
