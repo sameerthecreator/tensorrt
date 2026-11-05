@@ -13,7 +13,7 @@ jobs:
     - name: Checkout Repository
       uses: actions/checkout@v4
 
-    - name: Download Official ReShade Header
+    - name: Download Official ReShade Headers
       shell: pwsh
       run: |
         New-Item -ItemType Directory -Force -Path "include"
@@ -26,8 +26,9 @@ jobs:
     - name: Install CUDA Toolkit
       uses: Jimver/cuda-toolkit@v0.2.14
       with:
-        cuda-version: '12.4.1'
+        cuda: '12.4.1'
         method: 'network'
+        use-github-cache: 'false'
 
     - name: Download & Extract TensorRT Headers & Libs
       shell: pwsh
