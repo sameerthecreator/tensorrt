@@ -17,12 +17,19 @@ jobs:
       shell: pwsh
       run: |
         New-Item -ItemType Directory -Force -Path "include"
-        Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade.hpp" -OutFile "include/reshade.hpp"
-        Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_api.hpp" -OutFile "include/reshade_api.hpp"
-        Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_api_device.hpp" -OutFile "include/reshade_api_device.hpp"
-        Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_api_pipeline.hpp" -OutFile "include/reshade_api_pipeline.hpp"
-        Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_api_resource.hpp" -OutFile "include/reshade_api_resource.hpp"
-
+        $reshadeFiles = @(
+            "reshade.hpp",
+            "reshade_events.hpp",
+            "reshade_api.hpp",
+            "reshade_api_device.hpp",
+            "reshade_api_pipeline.hpp",
+            "reshade_api_resource.hpp",
+            "reshade_api_format.hpp",
+            "reshade_api_type.hpp"
+        )
+        foreach ($file in $reshadeFiles) {
+            Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/$file" -OutFile "include/$file"
+        }
     - name: Set up MSVC Developer Command Prompt
       uses: ilammy/msvc-dev-cmd@v1
       with:
