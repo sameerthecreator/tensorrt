@@ -13,23 +13,20 @@ jobs:
     - name: Checkout Repository
       uses: actions/checkout@v4
 
-    - name: Download Official ReShade Headers
+    - name: Download and Extract Official ReShade Headers
       shell: pwsh
       run: |
-        New-Item -ItemType Directory -Force -Path "include"
-        $reshadeFiles = @(
-            "reshade.hpp",
-            "reshade_events.hpp",
-            "reshade_api.hpp",
-            "reshade_api_device.hpp",
-            "reshade_api_pipeline.hpp",
-            "reshade_api_resource.hpp",
-            "reshade_api_format.hpp",
-            "reshade_api_type.hpp"
-        )
-        foreach ($file in $reshadeFiles) {
-            Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/$file" -OutFile "include/$file"
-        }
+        $zipUrl = "https://github.com/crosire/reshade/archive/refs/heads/main.zip"
+        Invoke-WebRequest -Uri $zipUrl -OutFile "reshade_src.zip"
+        Expand-Archive -Path "reshade_src.zip" -DestinationPath "reshade_temp"
+        
+        # Move the official include folder into your workspace root
+        Move-Item -Force -Path "reshade_temp/reshade-main/include" -Destination "include"
+        
+        # Clean up zip and temp files
+        Remove-Item -Recurse -Force "reshade_temp"
+        Remove-Item -Force "reshade_src.zip"
+
     - name: Set up MSVC Developer Command Prompt
       uses: ilammy/msvc-dev-cmd@v1
       with:
