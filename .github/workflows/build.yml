@@ -13,7 +13,7 @@ jobs:
     - name: Checkout Repository
       uses: actions/checkout@v4
 
-    - name: Download ReShade Headers & TensorRT SDK
+    - name: Download Official ReShade Headers
       shell: pwsh
       run: |
         New-Item -ItemType Directory -Force -Path "include"
@@ -22,9 +22,6 @@ jobs:
         Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_api_device.hpp" -OutFile "include/reshade_api_device.hpp"
         Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_api_pipeline.hpp" -OutFile "include/reshade_api_pipeline.hpp"
         Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_api_resource.hpp" -OutFile "include/reshade_api_resource.hpp"
-
-        Invoke-WebRequest -Uri "https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.0.1/zip/TensorRT-10.0.1.6.Windows.win10.cuda-12.4.zip" -OutFile "trt.zip" -UserAgent "NativeHost"
-        Expand-Archive -Path "trt.zip" -DestinationPath "trt_extracted"
 
     - name: Set up MSVC Developer Command Prompt
       uses: ilammy/msvc-dev-cmd@v1
@@ -36,9 +33,8 @@ jobs:
       run: |
         cl.exe /O2 /LD /std:c++17 src/neuralrr_main.cpp ^
           /I"include" ^
-          /I"trt_extracted\TensorRT-10.0.1.6\include" ^
           /link ^
-          /LIBPATH:"trt_extracted\TensorRT-10.0.1.6\lib" ^
+          /LIBPATH:"lib" ^
           nvinfer.lib cudart.lib ^
           /OUT:neuralrr.addon64
 
