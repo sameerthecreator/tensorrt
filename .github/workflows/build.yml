@@ -13,23 +13,20 @@ jobs:
     - name: Checkout Repository
       uses: actions/checkout@v4
 
+    - name: Create Required Include Directories
+      shell: pwsh
+      run: |
+        # Creates include/ and include/crt directories if they don't exist
+        New-Item -ItemType Directory -Force -Path "include/crt"
+
     - name: Download Official ReShade Headers
       shell: pwsh
       run: |
-        New-Item -ItemType Directory -Force -Path "include"
         Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade.hpp" -OutFile "include/reshade.hpp"
         Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_api.hpp" -OutFile "include/reshade_api.hpp"
         Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_api_device.hpp" -OutFile "include/reshade_api_device.hpp"
         Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_api_pipeline.hpp" -OutFile "include/reshade_api_pipeline.hpp"
         Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_api_resource.hpp" -OutFile "include/reshade_api_resource.hpp"
-
-    - name: Fix CUDA Header Structure
-      shell: pwsh
-      run: |
-        New-Item -ItemType Directory -Force -Path "include/crt"
-        if (Test-Path "include/host_config.h") {
-            Move-Item -Force "include/host_config.h" "include/crt/host_config.h"
-        }
 
     - name: Set up MSVC Developer Command Prompt
       uses: ilammy/msvc-dev-cmd@v1
