@@ -27,10 +27,19 @@ jobs:
         $cudaFiles = @(
             "cuda_runtime_api.h",
             "driver_types.h",
-            "vector_types.h"
+            "vector_types.h",
+            "host_defines.h"
         )
         foreach ($file in $cudaFiles) {
             Invoke-WebRequest -Uri "https://raw.githubusercontent.com/tpn/cuda-samples/master/v8.0/include/$file" -OutFile "include/$file"
+        }
+
+    - name: Fix CUDA Header Directory Structure
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Force -Path "include/crt"
+        if (Test-Path "include/host_defines.h") {
+            Copy-Item -Force "include/host_defines.h" "include/crt/host_defines.h"
         }
 
     - name: Set up MSVC Developer Command Prompt
