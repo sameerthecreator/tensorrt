@@ -1,78 +1,70 @@
-#include <windows.h>
-#include <d3d11.h>
-#include <cuda_runtime.h>
-#include <cuda_d3d11_interop.h>
-#include <NvInfer.h>
 #include <reshade.hpp>
-#include <fstream>
+#include <NvInfer.h>
+#include <windows.h>
+#include <memory>
 #include <vector>
 
-using namespace nvinfer1;
+// Simple TensorRT Logger
+class Logger : public nvinfer1::ILogger {
+    void log(Severity severity, const char* msg) noexcept override {
+        // Suppress verbose/info logs, catch warnings and errors
+        if (severity <= Severity::kWARNING) {
+            OutputDebugStringA("[NeuralRR] ");
+            OutputDebugStringA(msg);
+            OutputDebugStringA("\n");
+        }
+    }
+};
 
-class Logger : public ILogger {
-    void log(Severity severity, const char* msg) noexcept override {}
-} g_logger;
+static Logger g_logger;
+static nvinfer1::IRuntime* g_trtRuntime = nullptr;
+static nvinfer1::ICudaEngine* g_trtEngine = nullptr;
+static nvinfer1::IExecutionContext* g_trtContext = nullptr;
 
-IRuntime* g_runtime = nullptr;
-ICudaEngine* g_engine = nullptr;
-IExecutionContext* g_context = nullptr;
-cudaStream_t g_stream = nullptr;
-
-void* d_input = nullptr;
-void* d_output = nullptr;
-
-const int IN_W = 768;
-const int IN_H = 432;
-const int IN_C = 7;
-
-void init_tensorrt() {
-    std::ifstream file("sharp.engine", std::ios::binary);
-    if (!file.good()) return;
-
-    file.seekg(0, file.end);
-    size_t size = file.tellg();
-    file.seekg(0, file.beg);
-
-    std::vector<char> engine_data(size);
-    file.read(engine_data.data(), size);
-
-    g_runtime = createInferRuntime(g_logger);
-    g_engine = g_runtime->deserializeCudaEngine(engine_data.data(), size);
-    g_context = g_engine->createExecutionContext();
-
-    cudaStreamCreate(&g_stream);
-    cudaMalloc(&d_input, 1 * IN_C * IN_H * IN_W * sizeof(float));
-    cudaMalloc(&d_output, 1 * 3 * IN_H * IN_W * sizeof(float));
-
-    g_context->setInputShape("g_buffer", Dims4{1, IN_C, IN_H, IN_W});
-    g_context->setTensorAddress("g_buffer", d_input);
-    g_context->setTensorAddress("rendered_frame", d_output);
+// ReShade Device Initialization Hook
+static void on_init_device(reshade::api::device* device) {
+    OutputDebugStringA("[NeuralRR] Initializing TensorRT runtime...\n");
+    
+    // Initialize TensorRT runtime
+    g_trtRuntime = nvinfer1::createInferRuntime(g_logger);
+    if (!g_trtRuntime) {
+        OutputDebugStringA("[NeuralRR] Failed to create TensorRT runtime!\n");
+    }
+    
+    // Note: Load your compiled .engine model weights here if desired
 }
 
-static void on_present(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain) {
-    if (!g_context) return;
-    g_context->enqueueV3(g_stream);
-    cudaStreamSynchronize(g_stream);
+// ReShade Device Destruction Hook
+static void on_destroy_device(reshade::api::device* device) {
+    OutputDebugStringA("[NeuralRR] Cleaning up TensorRT resources...\n");
+    
+    if (g_trtContext) { g_trtContext->destroy(); g_trtContext = nullptr; }
+    if (g_trtEngine) { g_trtEngine->destroy(); g_trtEngine = nullptr; }
+    if (g_trtRuntime) { g_trtRuntime->destroy(); g_trtRuntime = nullptr; }
 }
 
-extern "C" __declspec(dllexport) const char* NAME = "NeuralRR TensorRT Addon";
-extern "C" __declspec(dllexport) const char* DESCRIPTION = "Real-time AI post-processing shader";
+// ReShade Present Hook (called every frame right before swapping buffers)
+static void on_present(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain, const reshade::api::viewport* source_rect, const reshade::api::rect* dest_rect, uint32_t dirty_rect_count, const reshade::api::rect* dirty_rects) {
+    // Insert your neural rendering pass or TensorRT inference execution here
+}
 
-BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID) {
-    switch (reason) {
+// Addon Entry Point
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpvReserved) {
+    switch (fdwReason) {
         case DLL_PROCESS_ATTACH:
-            if (!reshade::register_addon(hinst)) return FALSE;
-            init_tensorrt();
-            reshade::register_event<reshade::addon_event::present>(on_present);
+            if (!reshade::register_addon(hModule)) {
+                return FALSE;
+            }
+            reshade::register_event<reshade::addon_event::init_device>(&on_init_device);
+            reshade::register_event<reshade::addon_event::destroy_device>(&on_destroy_device);
+            reshade::register_event<reshade::addon_event::present>(&on_present);
             break;
+
         case DLL_PROCESS_DETACH:
-            reshade::unregister_addon(hinst);
-            if (d_input) cudaFree(d_input);
-            if (d_output) cudaFree(d_output);
-            if (g_stream) cudaStreamDestroy(g_stream);
-            delete g_context;
-            delete g_engine;
-            delete g_runtime;
+            reshade::unregister_event<reshade::addon_event::init_device>(&on_init_device);
+            reshade::unregister_event<reshade::addon_event::destroy_device>(&on_destroy_device);
+            reshade::unregister_event<reshade::addon_event::present>(&on_present);
+            reshade::unregister_addon(hModule);
             break;
     }
     return TRUE;
