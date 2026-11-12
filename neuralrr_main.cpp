@@ -129,9 +129,10 @@ extern "C" __global__ void unpack_hdr_to_rgba(
     b = b < 0.0f ? 0.0f : (b > 1.0f ? 1.0f : b);
 
     int rgba_idx = idx * 4;
-    rgba_out[rgba_idx + 0] = (unsigned char)(r * 255.0f + 0.5f);
+    // Swap output to DX12 BGRA order
+    rgba_out[rgba_idx + 0] = (unsigned char)(b * 255.0f + 0.5f);
     rgba_out[rgba_idx + 1] = (unsigned char)(g * 255.0f + 0.5f);
-    rgba_out[rgba_idx + 2] = (unsigned char)(b * 255.0f + 0.5f);
+    rgba_out[rgba_idx + 2] = (unsigned char)(r * 255.0f + 0.5f);
     rgba_out[rgba_idx + 3] = 255;
 }
 )";
