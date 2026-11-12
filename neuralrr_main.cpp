@@ -97,9 +97,10 @@ extern "C" __global__ void pack_sdr2hdr_gbuffer(
     if (idx >= total_pixels) return;
 
     int rgba_idx = idx * 4;
-    float r = (float)rgba_in[rgba_idx + 0] * (1.0f / 255.0f);
+    // DX12 backbuffer is BGRA format -> flip indices 0 and 2 to get correct RGB
+    float b = (float)rgba_in[rgba_idx + 0] * (1.0f / 255.0f);
     float g = (float)rgba_in[rgba_idx + 1] * (1.0f / 255.0f);
-    float b = (float)rgba_in[rgba_idx + 2] * (1.0f / 255.0f);
+    float r = (float)rgba_in[rgba_idx + 2] * (1.0f / 255.0f);
     float luma = 0.2126f * r + 0.7152f * g + 0.0722f * b;
 
     gbuf_out[0 * total_pixels + idx] = float_to_fp16(r);
