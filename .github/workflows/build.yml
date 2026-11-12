@@ -21,64 +21,39 @@ jobs:
         Copy-Item -Recurse -Force "reshade_repo/include/*" "include/"
         Remove-Item -Recurse -Force "reshade_repo"
 
-    - name: Download Missing CUDA API Headers for TensorRT
+    - name: Generate Minimal Self-Contained CUDA Stub Header for TensorRT
       shell: pwsh
       run: |
-        $cudaFiles = @(
-            "cuda_runtime_api.h",
-            "driver_types.h",
-            "vector_types.h",
-            "host_defines.h"
-        )
-        foreach ($file in $cudaFiles) {
-            Invoke-WebRequest -Uri "https://raw.githubusercontent.com/tpn/cuda-samples/master/v8.0/include/$file" -OutFile "include/$file"
+        # Remove any broken raw CUDA headers from include/ so they never loop
+        $badHeaders = @("cuda_runtime.h", "cuda_runtime_api.h", "device_types.h", "host_defines.h", "driver_types.h", "vector_types.h")
+        foreach ($h in $badHeaders) {
+            if (Test-Path "include/$h") { Remove-Item -Force "include/$h" }
         }
+        if (Test-Path "include/crt") { Remove-Item -Recurse -Force "include/crt" }
 
-    - name: Fix CUDA Header Directory Structure & Patch
-      shell: pwsh
-      run: |
-        New-Item -ItemType Directory -Force -Path "include/crt"
-        if (Test-Path "include/host_defines.h") {
-            Copy-Item -Force "include/host_defines.h" "include/crt/host_defines.h"
-        }
-        
-        $headerPath = "include/cuda_runtime_api.h"
-        if (Test-Path $headerPath) {
-            $content = Get-Content $headerPath -Raw
-            $content = $content -replace '#include\s+"cuda_device_runtime_api\.h"', '// #include "cuda_device_runtime_api.h"'
-            $content = $content -replace '#include\s+<cuda_device_runtime_api\.h>', '// #include <cuda_device_runtime_api.h>'
-            Set-Content $headerPath $content
-        }
-
-    - name: Download CUDA and TensorRT Import Libraries via dotnet
-      shell: pwsh
-      run: |
-        New-Item -ItemType Directory -Force -Path "lib_temp"
-        Set-Location "lib_temp"
-        dotnet new classlib --force
-        dotnet add package NVIDIA.CUDART.Redist --version 12.4.127
-        dotnet add package NVIDIA.TensorRT --version 10.3.0
-        Set-Location ".."
-        
-        # Copy all required .lib files into the lib/ folder
-        New-Item -ItemType Directory -Force -Path "lib"
-        Get-ChildItem -Path "lib_temp" -Recurse -Filter "*.lib" | Copy-Item -Destination "lib/" -Force
-        Remove-Item -Recurse -Force "lib_temp"
+        # Create a clean, zero-dependency cuda_runtime_api.h stub that satisfies NvInferRuntimeBase.h
+        $stub = @"
+        #pragma once
+        #include <cstdint>
+        #include <cstddef>
+        typedef int cudaError_t;
+        typedef struct CUstream_st* cudaStream_t;
+        typedef struct CUevent_st* cudaEvent_t;
+        struct cudaDeviceProp { char name[256]; size_t totalGlobalMem; int major; int minor; };
+        "@
+        Set-Content -Path "include/cuda_runtime_api.h" -Value $stub
 
     - name: Set up MSVC Developer Command Prompt
       uses: ilammy/msvc-dev-cmd@v1
       with:
         arch: x64
 
-    - name: Compile ReShade Addon DLL
+    - name: Compile ReShade Addon DLL (Zero .lib Dependencies)
       shell: cmd
       run: |
-        cl.exe /O2 /LD /std:c++17 neuralrr_main.cpp ^
+        cl.exe /O2 /Oi /GL /LD /EHsc /std:c++17 neuralrr_main.cpp ^
           /I"include" ^
-          /link ^
-          /LIBPATH:"lib" ^
-          nvinfer.lib cudart.lib ^
-          /OUT:neuralrr.addon64
+          /link /LTCG /OUT:neuralrr.addon64
 
     - name: Upload Compiled Binary
       uses: actions/upload-artifact@v4
