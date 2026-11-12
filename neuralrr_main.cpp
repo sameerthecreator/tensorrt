@@ -1,16 +1,16 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d11.h>
+#include <d3d12.h>
 #include <reshade.hpp>
 #include <NvInfer.h>
 #include <fstream>
 #include <vector>
 #include <cstdint>
 #include <cstring>
-#include <cmath>
 
-// Fixes error LNK2001: unresolved external symbol __imp_GetAsyncKeyState
-#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "d3d12.lib")
+#pragma comment(lib, "dxgi.lib")
 
 // ============================================================================
 // 1. DYNAMIC CUDA & TENSORRT FUNCTION POINTERS
@@ -74,7 +74,7 @@ static CUfunction g_fnPack   = nullptr;
 static CUfunction g_fnUnpack = nullptr;
 
 // ============================================================================
-// 2. CUDA C KERNELS (WITH ACES TONE-MAPPING, EXPOSURE, CONTRAST & SPLIT-SCREEN)
+// 2. GPU FORMAT KERNELS (BGRA8/RGBA8 <-> 1x7x1080x1920 FP16)
 // ============================================================================
 static const char* g_cudaKernelSrc = R"(
 extern "C" __device__ unsigned short float_to_fp16(float f) {
@@ -86,15 +86,6 @@ extern "C" __device__ float fp16_to_float(unsigned short h) {
     float ret;
     asm("{ cvt.f32.f16 %0, %1; }" : "=f"(ret) : "h"(h));
     return ret;
-}
-extern "C" __device__ float aces_tonemap(float x) {
-    const float a = 2.51f;
-    const float b = 0.03f;
-    const float c = 2.43f;
-    const float d = 0.59f;
-    const float e = 0.14f;
-    float v = (x * (a * x + b)) / (x * (c * x + d) + e);
-    return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
 }
 
 extern "C" __global__ void pack_sdr2hdr_gbuffer(
@@ -122,58 +113,25 @@ extern "C" __global__ void pack_sdr2hdr_gbuffer(
 
 extern "C" __global__ void unpack_hdr_to_rgba(
     const unsigned short* __restrict__ hdr_in,
-    unsigned char* __restrict__ rgba_io,
-    int total_pixels,
-    int width,
-    int split_screen,
-    int use_aces,
-    float exposure,
-    float contrast)
+    unsigned char* __restrict__ rgba_out,
+    int total_pixels)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total_pixels) return;
 
-    int x = idx % width;
-    if (split_screen && x < (width / 2)) {
-        return;
-    }
-
-    int rgba_idx = idx * 4;
-    if (split_screen && (x == (width / 2) || x == (width / 2) + 1)) {
-        rgba_io[rgba_idx + 0] = 255;
-        rgba_io[rgba_idx + 1] = 255;
-        rgba_io[rgba_idx + 2] = 255;
-        rgba_io[rgba_idx + 3] = 255;
-        return;
-    }
-
-    float r = fp16_to_float(hdr_in[0 * total_pixels + idx]) * exposure;
-    float g = fp16_to_float(hdr_in[1 * total_pixels + idx]) * exposure;
-    float b = fp16_to_float(hdr_in[2 * total_pixels + idx]) * exposure;
-
-    if (r < 0.0f) r = 0.0f;
-    if (g < 0.0f) g = 0.0f;
-    if (b < 0.0f) b = 0.0f;
-
-    if (use_aces) {
-        r = aces_tonemap(r);
-        g = aces_tonemap(g);
-        b = aces_tonemap(b);
-    }
-
-    // Apply midtone contrast curve around 0.5
-    r = (r - 0.5f) * contrast + 0.5f;
-    g = (g - 0.5f) * contrast + 0.5f;
-    b = (b - 0.5f) * contrast + 0.5f;
+    float r = fp16_to_float(hdr_in[0 * total_pixels + idx]);
+    float g = fp16_to_float(hdr_in[1 * total_pixels + idx]);
+    float b = fp16_to_float(hdr_in[2 * total_pixels + idx]);
 
     r = r < 0.0f ? 0.0f : (r > 1.0f ? 1.0f : r);
     g = g < 0.0f ? 0.0f : (g > 1.0f ? 1.0f : g);
     b = b < 0.0f ? 0.0f : (b > 1.0f ? 1.0f : b);
 
-    rgba_io[rgba_idx + 0] = (unsigned char)(r * 255.0f + 0.5f);
-    rgba_io[rgba_idx + 1] = (unsigned char)(g * 255.0f + 0.5f);
-    rgba_io[rgba_idx + 2] = (unsigned char)(b * 255.0f + 0.5f);
-    rgba_io[rgba_idx + 3] = 255;
+    int rgba_idx = idx * 4;
+    rgba_out[rgba_idx + 0] = (unsigned char)(r * 255.0f + 0.5f);
+    rgba_out[rgba_idx + 1] = (unsigned char)(g * 255.0f + 0.5f);
+    rgba_out[rgba_idx + 2] = (unsigned char)(b * 255.0f + 0.5f);
+    rgba_out[rgba_idx + 3] = 255;
 }
 )";
 
@@ -195,13 +153,9 @@ static inline float cpu_f16_to_f32(uint16_t h) {
     uint32_t x = sign | (exp << 23) | (mant << 13);
     return *(float*)&x;
 }
-static inline float cpu_aces(float x) {
-    float v = (x * (2.51f * x + 0.03f)) / (x * (2.43f * x + 0.59f) + 0.14f);
-    return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
-}
 
 // ============================================================================
-// 3. GLOBAL STATE & HOTKEY ADJUSTERS
+// 3. GLOBAL ENGINE & DIRECTX 12 BUFFER STATE
 // ============================================================================
 class Logger : public nvinfer1::ILogger {
     void log(Severity severity, const char* msg) noexcept override {
@@ -218,100 +172,23 @@ static nvinfer1::ICudaEngine*       g_trtEngine  = nullptr;
 static nvinfer1::IExecutionContext* g_trtContext = nullptr;
 static cudaStream_t                 g_cudaStream = nullptr;
 
-static void*                  g_dRgbaRaw = nullptr;
-static void*                  g_dInput   = nullptr;
-static void*                  g_dOutput  = nullptr;
+static void*                g_dRgbaRaw = nullptr;
+static void*                g_dInput   = nullptr;
+static void*                g_dOutput  = nullptr;
+static std::vector<uint16_t> g_cpuGbuf;
+static std::vector<uint16_t> g_cpuOut;
+
+// Native D3D12 Readback & Upload Buffers (Since D3D12 forbids TEXTURE_2D on CPU heaps!)
+static ID3D12Resource*                  g_d3d12ReadbackBuf = nullptr;
+static ID3D12Resource*                  g_d3d12UploadBuf   = nullptr;
+static D3D12_PLACED_SUBRESOURCE_FOOTPRINT g_d3d12Footprint = {};
+static uint8_t*                         g_mappedReadPtr    = nullptr;
+static uint8_t*                         g_mappedWritePtr   = nullptr;
+
+// Fallback ReShade textures for D3D11
 static reshade::api::resource g_texRead  = { 0 };
 static reshade::api::resource g_texWrite = { 0 };
-static uint32_t               g_width = 1920, g_height = 1080;
-static std::vector<uint16_t>  g_cpuGbuf;
-static std::vector<uint16_t>  g_cpuOut;
-
-// Toggles & Live Adjusters
-static bool  g_enableNeural = true;
-static bool  g_splitScreen  = false;
-static bool  g_useAces      = true;
-static float g_exposure     = 1.0f;
-static float g_contrast     = 1.0f;
-
-static bool g_f11WasDown  = false;
-static bool g_f10WasDown  = false;
-static bool g_f9WasDown   = false;
-static bool g_pgUpWasDown = false;
-static bool g_pgDnWasDown = false;
-static bool g_homeWasDown = false;
-static bool g_endWasDown  = false;
-static bool g_bsWasDown   = false;
-
-static void poll_hotkeys() {
-    // F11: Master Enable / Disable
-    bool f11 = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
-    if (f11 && !g_f11WasDown) {
-        g_enableNeural = !g_enableNeural;
-        Beep(g_enableNeural ? 800 : 400, 60);
-    }
-    g_f11WasDown = f11;
-
-    // F10: 50/50 Split-Screen
-    bool f10 = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
-    if (f10 && !g_f10WasDown) {
-        g_splitScreen = !g_splitScreen;
-        Beep(g_splitScreen ? 1000 : 500, 60);
-    }
-    g_f10WasDown = f10;
-
-    // F9: Toggle ACES Filmic Tone-Mapping vs Linear Clamp
-    bool f9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
-    if (f9 && !g_f9WasDown) {
-        g_useAces = !g_useAces;
-        Beep(g_useAces ? 900 : 450, 60);
-    }
-    g_f9WasDown = f9;
-
-    // Page Up / Page Down: Exposure +/- 0.15
-    bool pgUp = (GetAsyncKeyState(VK_PRIOR) & 0x8000) != 0;
-    if (pgUp && !g_pgUpWasDown) {
-        g_exposure += 0.15f;
-        if (g_exposure > 4.0f) g_exposure = 4.0f;
-        Beep(700, 30);
-    }
-    g_pgUpWasDown = pgUp;
-
-    bool pgDn = (GetAsyncKeyState(VK_NEXT) & 0x8000) != 0;
-    if (pgDn && !g_pgDnWasDown) {
-        g_exposure -= 0.15f;
-        if (g_exposure < 0.15f) g_exposure = 0.15f;
-        Beep(550, 30);
-    }
-    g_pgDnWasDown = pgDn;
-
-    // Ctrl + Home / Ctrl + End: Contrast +/- 0.08
-    bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-    bool home = ctrl && ((GetAsyncKeyState(VK_HOME) & 0x8000) != 0);
-    if (home && !g_homeWasDown) {
-        g_contrast += 0.08f;
-        if (g_contrast > 2.5f) g_contrast = 2.5f;
-        Beep(750, 30);
-    }
-    g_homeWasDown = home;
-
-    bool endKey = ctrl && ((GetAsyncKeyState(VK_END) & 0x8000) != 0);
-    if (endKey && !g_endWasDown) {
-        g_contrast -= 0.08f;
-        if (g_contrast < 0.4f) g_contrast = 0.4f;
-        Beep(500, 30);
-    }
-    g_endWasDown = endKey;
-
-    // Ctrl + Backspace: Reset Exposure & Contrast to 1.0
-    bool bs = ctrl && ((GetAsyncKeyState(VK_BACK) & 0x8000) != 0);
-    if (bs && !g_bsWasDown) {
-        g_exposure = 1.0f;
-        g_contrast = 1.0f;
-        Beep(600, 80);
-    }
-    g_bsWasDown = bs;
-}
+static bool                   g_isD3D12  = false;
 
 static void try_compile_gpu_kernels() {
     g_hNvCuda = LoadLibraryA("nvcuda.dll");
@@ -344,7 +221,6 @@ static void try_compile_gpu_kernels() {
             if (fn_cuModuleLoadData(&g_cuMod, ptx.data()) == 0) {
                 fn_cuModuleGetFunction(&g_fnPack,   g_cuMod, "pack_sdr2hdr_gbuffer");
                 fn_cuModuleGetFunction(&g_fnUnpack, g_cuMod, "unpack_hdr_to_rgba");
-                OutputDebugStringA("[NeuralRR] SUCCESS: NVRTC GPU Kernels Compiled!\n");
             }
         }
         fnDestroy(&prog);
@@ -375,8 +251,20 @@ static bool load_libraries() {
 static void on_init_device(reshade::api::device* device) {
     if (!load_libraries()) return;
     fn_cudaStreamCreate(&g_cudaStream);
+    g_isD3D12 = (device->get_api() == reshade::api::device_api::d3d12);
 
-    g_trtRuntime = static_cast<nvinfer1::IRuntime*>(fn_createInferRuntime(&g_logger, NV_TENSORRT_VERSION));
+    // Fix Bug 1: Probe exact TensorRT version (110400, NV_TENSORRT_VERSION, etc.) so TRT 11.4 never rejects header version!
+    int32_t candidateVersions[] = { 110400, 110300, 110200, 110100, 110000, NV_TENSORRT_VERSION, 100300, 100000 };
+    for (int32_t v : candidateVersions) {
+        g_trtRuntime = static_cast<nvinfer1::IRuntime*>(fn_createInferRuntime(&g_logger, v));
+        if (g_trtRuntime) break;
+    }
+    if (!g_trtRuntime) {
+        for (int32_t v = 100000; v <= 120000; v += 100) {
+            g_trtRuntime = static_cast<nvinfer1::IRuntime*>(fn_createInferRuntime(&g_logger, v));
+            if (g_trtRuntime) break;
+        }
+    }
     if (!g_trtRuntime) return;
 
     std::ifstream file("neuralrr_fp16.engine", std::ios::binary | std::ios::ate);
@@ -395,11 +283,6 @@ static void on_init_device(reshade::api::device* device) {
 static void on_init_swapchain(reshade::api::swapchain* swapchain, bool resize) {
     if (!g_trtContext) return;
     reshade::api::device* dev = swapchain->get_device();
-
-    reshade::api::resource backbuffer = swapchain->get_current_back_buffer();
-    reshade::api::resource_desc desc = dev->get_resource_desc(backbuffer);
-    g_width  = desc.texture.width  ? desc.texture.width  : 1920;
-    g_height = desc.texture.height ? desc.texture.height : 1080;
 
     size_t pixels = (size_t)1920 * 1080;
     fn_cudaMalloc(&g_dRgbaRaw, pixels * 4);
@@ -424,53 +307,60 @@ static void on_init_swapchain(reshade::api::swapchain* swapchain, bool resize) {
         g_trtContext->setTensorAddress(outName, g_dOutput);
     }
 
-    reshade::api::resource_desc readDesc = desc;
-    readDesc.heap  = reshade::api::memory_heap::gpu_to_cpu;
-    readDesc.usage = reshade::api::resource_usage::copy_dest;
+    // Fix Bug 2: In DirectX 12, create native D3D12 Readback & Upload linear buffers (persistent mapped!)
+    if (g_isD3D12) {
+        ID3D12Device* d3d12Dev = reinterpret_cast<ID3D12Device*>(dev->get_native());
+        ID3D12Resource* bbRes  = reinterpret_cast<ID3D12Resource*>(swapchain->get_current_back_buffer().handle);
+        D3D12_RESOURCE_DESC bbDesc = bbRes->GetDesc();
 
-    reshade::api::resource_desc writeDesc = desc;
-    writeDesc.heap  = reshade::api::memory_heap::cpu_to_gpu;
-    writeDesc.usage = reshade::api::resource_usage::copy_source;
+        UINT64 totalBytes = 0;
+        d3d12Dev->GetCopyableFootprints(&bbDesc, 0, 1, 0, &g_d3d12Footprint, nullptr, nullptr, &totalBytes);
 
-    dev->create_resource(readDesc,  nullptr, reshade::api::resource_usage::copy_dest,   &g_texRead);
-    dev->create_resource(writeDesc, nullptr, reshade::api::resource_usage::copy_source, &g_texWrite);
+        D3D12_HEAP_PROPERTIES readHeap = {};
+        readHeap.Type = D3D12_HEAP_TYPE_READBACK;
+
+        D3D12_HEAP_PROPERTIES writeHeap = {};
+        writeHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+        D3D12_RESOURCE_DESC bufDesc = {};
+        bufDesc.Dimension          = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bufDesc.Width              = totalBytes;
+        bufDesc.Height             = 1;
+        bufDesc.DepthOrArraySize   = 1;
+        bufDesc.MipLevels          = 1;
+        bufDesc.Format             = DXGI_FORMAT_UNKNOWN;
+        bufDesc.SampleDesc.Count   = 1;
+        bufDesc.Layout             = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+        if (SUCCEEDED(d3d12Dev->CreateCommittedResource(&readHeap, D3D12_HEAP_FLAG_NONE, &bufDesc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_d3d12ReadbackBuf)))) {
+            g_d3d12ReadbackBuf->Map(0, nullptr, reinterpret_cast<void**>(&g_mappedReadPtr));
+        }
+        if (SUCCEEDED(d3d12Dev->CreateCommittedResource(&writeHeap, D3D12_HEAP_FLAG_NONE, &bufDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_d3d12UploadBuf)))) {
+            g_d3d12UploadBuf->Map(0, nullptr, reinterpret_cast<void**>(&g_mappedWritePtr));
+        }
+    } else {
+        reshade::api::resource backbuffer = swapchain->get_current_back_buffer();
+        reshade::api::resource_desc desc = dev->get_resource_desc(backbuffer);
+
+        reshade::api::resource_desc readDesc = desc;
+        readDesc.heap  = reshade::api::memory_heap::gpu_to_cpu;
+        readDesc.usage = reshade::api::resource_usage::copy_dest;
+
+        reshade::api::resource_desc writeDesc = desc;
+        writeDesc.heap  = reshade::api::memory_heap::cpu_to_gpu;
+        writeDesc.usage = reshade::api::resource_usage::copy_source;
+
+        dev->create_resource(readDesc,  nullptr, reshade::api::resource_usage::copy_dest,   &g_texRead);
+        dev->create_resource(writeDesc, nullptr, reshade::api::resource_usage::copy_source, &g_texWrite);
+    }
 }
 
-static void on_present(
-    reshade::api::command_queue* queue,
-    reshade::api::swapchain* swapchain,
-    const reshade::api::rect* source_rect,
-    const reshade::api::rect* dest_rect,
-    uint32_t dirty_rect_count,
-    const reshade::api::rect* dirty_rects)
-{
-    poll_hotkeys();
-    if (!g_enableNeural) return;
-
-    if (!g_trtContext || !g_texRead.handle || !g_texWrite.handle) return;
-
-    reshade::api::device* dev = swapchain->get_device();
-    reshade::api::command_list* cmd = queue->get_immediate_command_list();
-    reshade::api::resource backbuffer = swapchain->get_current_back_buffer();
-
+static void process_frame_pixels(const uint8_t* srcPtr, size_t srcPitch, uint8_t* dstPtr, size_t dstPitch) {
     int totalPixels = 1920 * 1080;
-    int width       = 1920;
-    int splitFlag   = g_splitScreen ? 1 : 0;
-    int acesFlag    = g_useAces ? 1 : 0;
-    float expVal    = g_exposure;
-    float conVal    = g_contrast;
     size_t rowBytes = 1920 * 4;
 
-    cmd->copy_resource(backbuffer, g_texRead);
-    queue->flush_immediate_command_list();
-    queue->wait_idle();
-
-    reshade::api::subresource_data mapIn = {}, mapOut = {};
-    if (!dev->map_texture_region(g_texRead, 0, nullptr, reshade::api::map_access::read_only, &mapIn)) return;
-
     if (g_fnPack && g_fnUnpack && fn_cuLaunchKernel) {
-        fn_cudaMemcpy2DAsync(g_dRgbaRaw, rowBytes, mapIn.data, mapIn.row_pitch, rowBytes, 1080, cudaMemcpyHostToDevice, g_cudaStream);
-        dev->unmap_texture_region(g_texRead, 0);
+        fn_cudaMemcpy2DAsync(g_dRgbaRaw, rowBytes, srcPtr, srcPitch, rowBytes, 1080, cudaMemcpyHostToDevice, g_cudaStream);
 
         int threads = 256;
         int blocks  = (totalPixels + threads - 1) / threads;
@@ -479,18 +369,14 @@ static void on_present(
 
         g_trtContext->enqueueV3(g_cudaStream);
 
-        void* unpackArgs[] = { &g_dOutput, &g_dRgbaRaw, &totalPixels, &width, &splitFlag, &acesFlag, &expVal, &conVal };
+        void* unpackArgs[] = { &g_dOutput, &g_dRgbaRaw, &totalPixels };
         fn_cuLaunchKernel(g_fnUnpack, blocks, 1, 1, threads, 1, 1, 0, g_cudaStream, unpackArgs, nullptr);
 
-        if (dev->map_texture_region(g_texWrite, 0, nullptr, reshade::api::map_access::write_only, &mapOut)) {
-            fn_cudaMemcpy2DAsync(mapOut.data, mapOut.row_pitch, g_dRgbaRaw, rowBytes, rowBytes, 1080, cudaMemcpyDeviceToHost, g_cudaStream);
-            fn_cudaStreamSynchronize(g_cudaStream);
-            dev->unmap_texture_region(g_texWrite, 0);
-        }
+        fn_cudaMemcpy2DAsync(dstPtr, dstPitch, g_dRgbaRaw, rowBytes, rowBytes, 1080, cudaMemcpyDeviceToHost, g_cudaStream);
+        fn_cudaStreamSynchronize(g_cudaStream);
     } else {
-        const uint8_t* src = static_cast<const uint8_t*>(mapIn.data);
         for (int y = 0; y < 1080; ++y) {
-            const uint8_t* row = src + y * mapIn.row_pitch;
+            const uint8_t* row = srcPtr + y * srcPitch;
             for (int x = 0; x < 1920; ++x) {
                 int idx = y * 1920 + x;
                 float r = row[x * 4 + 0] * (1.0f / 255.0f);
@@ -513,53 +399,129 @@ static void on_present(
         fn_cudaMemcpyAsync(g_cpuOut.data(), g_dOutput, totalPixels * 3 * sizeof(uint16_t), cudaMemcpyDeviceToHost, g_cudaStream);
         fn_cudaStreamSynchronize(g_cudaStream);
 
-        if (dev->map_texture_region(g_texWrite, 0, nullptr, reshade::api::map_access::write_only, &mapOut)) {
-            uint8_t* dst = static_cast<uint8_t*>(mapOut.data);
-            for (int y = 0; y < 1080; ++y) {
-                const uint8_t* srcRow = src + y * mapIn.row_pitch;
-                uint8_t* dstRow = dst + y * mapOut.row_pitch;
-                for (int x = 0; x < 1920; ++x) {
-                    if (g_splitScreen && x < 960) {
-                        dstRow[x * 4 + 0] = srcRow[x * 4 + 0];
-                        dstRow[x * 4 + 1] = srcRow[x * 4 + 1];
-                        dstRow[x * 4 + 2] = srcRow[x * 4 + 2];
-                        dstRow[x * 4 + 3] = 255;
-                        continue;
-                    }
-                    int idx = y * 1920 + x;
-                    float r = cpu_f16_to_f32(g_cpuOut[0 * totalPixels + idx]) * expVal;
-                    float g = cpu_f16_to_f32(g_cpuOut[1 * totalPixels + idx]) * expVal;
-                    float b = cpu_f16_to_f32(g_cpuOut[2 * totalPixels + idx]) * expVal;
-                    if (g_useAces) {
-                        r = cpu_aces(r);
-                        g = cpu_aces(g);
-                        b = cpu_aces(b);
-                    }
-                    r = (r - 0.5f) * conVal + 0.5f;
-                    g = (g - 0.5f) * conVal + 0.5f;
-                    b = (b - 0.5f) * conVal + 0.5f;
-                    r = r < 0.0f ? 0.0f : (r > 1.0f ? 1.0f : r);
-                    g = g < 0.0f ? 0.0f : (g > 1.0f ? 1.0f : g);
-                    b = b < 0.0f ? 0.0f : (b > 1.0f ? 1.0f : b);
-                    dstRow[x * 4 + 0] = (uint8_t)(r * 255.0f);
-                    dstRow[x * 4 + 1] = (uint8_t)(g * 255.0f);
-                    dstRow[x * 4 + 2] = (uint8_t)(b * 255.0f);
-                    dstRow[x * 4 + 3] = 255;
-                }
+        for (int y = 0; y < 1080; ++y) {
+            uint8_t* dstRow = dstPtr + y * dstPitch;
+            for (int x = 0; x < 1920; ++x) {
+                int idx = y * 1920 + x;
+                float r = cpu_f16_to_f32(g_cpuOut[0 * totalPixels + idx]);
+                float g = cpu_f16_to_f32(g_cpuOut[1 * totalPixels + idx]);
+                float b = cpu_f16_to_f32(g_cpuOut[2 * totalPixels + idx]);
+                r = r < 0.0f ? 0.0f : (r > 1.0f ? 1.0f : r);
+                g = g < 0.0f ? 0.0f : (g > 1.0f ? 1.0f : g);
+                b = b < 0.0f ? 0.0f : (b > 1.0f ? 1.0f : b);
+                dstRow[x * 4 + 0] = (uint8_t)(r * 255.0f);
+                dstRow[x * 4 + 1] = (uint8_t)(g * 255.0f);
+                dstRow[x * 4 + 2] = (uint8_t)(b * 255.0f);
+                dstRow[x * 4 + 3] = 255;
             }
-            dev->unmap_texture_region(g_texWrite, 0);
         }
-        dev->unmap_texture_region(g_texRead, 0);
     }
+}
 
-    cmd->copy_resource(g_texWrite, backbuffer);
-    queue->flush_immediate_command_list();
+static void on_present(
+    reshade::api::command_queue* queue,
+    reshade::api::swapchain* swapchain,
+    const reshade::api::rect* source_rect,
+    const reshade::api::rect* dest_rect,
+    uint32_t dirty_rect_count,
+    const reshade::api::rect* dirty_rects)
+{
+    if (!g_trtContext) return;
+
+    reshade::api::device* dev = swapchain->get_device();
+    reshade::api::command_list* cmd = queue->get_immediate_command_list();
+    reshade::api::resource backbuffer = swapchain->get_current_back_buffer();
+
+    if (g_isD3D12 && g_d3d12ReadbackBuf && g_d3d12UploadBuf && g_mappedReadPtr && g_mappedWritePtr) {
+        ID3D12GraphicsCommandList* d3d12Cmd = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd->get_native());
+        ID3D12Resource* bbRes = reinterpret_cast<ID3D12Resource*>(backbuffer.handle);
+
+        // 1. Transition D3D12 Backbuffer: PRESENT -> COPY_SOURCE
+        D3D12_RESOURCE_BARRIER barrier = {};
+        barrier.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource   = bbRes;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+        barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        d3d12Cmd->ResourceBarrier(1, &barrier);
+
+        // 2. Copy Backbuffer Texture -> D3D12 Readback Buffer
+        D3D12_TEXTURE_COPY_LOCATION srcLoc = {};
+        srcLoc.pResource        = bbRes;
+        srcLoc.Type             = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        srcLoc.SubresourceIndex = 0;
+
+        D3D12_TEXTURE_COPY_LOCATION dstLoc = {};
+        dstLoc.pResource       = g_d3d12ReadbackBuf;
+        dstLoc.Type            = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dstLoc.PlacedFootprint = g_d3d12Footprint;
+
+        d3d12Cmd->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
+
+        // Wait for D3D12 copy to finish
+        queue->flush_immediate_command_list();
+        queue->wait_idle();
+
+        // 3. Process Frame Through TensorRT SDR2HDR Engine
+        process_frame_pixels(g_mappedReadPtr, g_d3d12Footprint.Footprint.RowPitch, g_mappedWritePtr, g_d3d12Footprint.Footprint.RowPitch);
+
+        // 4. Transition Backbuffer: COPY_SOURCE -> COPY_DEST
+        cmd = queue->get_immediate_command_list();
+        d3d12Cmd = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd->get_native());
+
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+        d3d12Cmd->ResourceBarrier(1, &barrier);
+
+        // 5. Copy Processed Upload Buffer -> D3D12 Backbuffer Texture
+        D3D12_TEXTURE_COPY_LOCATION uploadSrc = {};
+        uploadSrc.pResource       = g_d3d12UploadBuf;
+        uploadSrc.Type            = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        uploadSrc.PlacedFootprint = g_d3d12Footprint;
+
+        D3D12_TEXTURE_COPY_LOCATION bbDst = {};
+        bbDst.pResource        = bbRes;
+        bbDst.Type             = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        bbDst.SubresourceIndex = 0;
+
+        d3d12Cmd->CopyTextureRegion(&bbDst, 0, 0, 0, &uploadSrc, nullptr);
+
+        // 6. Transition Backbuffer: COPY_DEST -> PRESENT
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
+        d3d12Cmd->ResourceBarrier(1, &barrier);
+
+        queue->flush_immediate_command_list();
+    }
+    else if (g_texRead.handle && g_texWrite.handle) {
+        cmd->barrier(backbuffer, reshade::api::resource_usage::present, reshade::api::resource_usage::copy_source);
+        cmd->copy_resource(backbuffer, g_texRead);
+        cmd->barrier(backbuffer, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::present);
+        queue->flush_immediate_command_list();
+        queue->wait_idle();
+
+        reshade::api::subresource_data mapIn = {}, mapOut = {};
+        if (dev->map_texture_region(g_texRead, 0, nullptr, reshade::api::map_access::read_only, &mapIn)) {
+            if (dev->map_texture_region(g_texWrite, 0, nullptr, reshade::api::map_access::write_only, &mapOut)) {
+                process_frame_pixels(static_cast<const uint8_t*>(mapIn.data), mapIn.row_pitch, static_cast<uint8_t*>(mapOut.data), mapOut.row_pitch);
+                dev->unmap_texture_region(g_texWrite, 0);
+            }
+            dev->unmap_texture_region(g_texRead, 0);
+        }
+
+        cmd->barrier(backbuffer, reshade::api::resource_usage::present, reshade::api::resource_usage::copy_dest);
+        cmd->copy_resource(g_texWrite, backbuffer);
+        cmd->barrier(backbuffer, reshade::api::resource_usage::copy_dest, reshade::api::resource_usage::present);
+        queue->flush_immediate_command_list();
+    }
 }
 
 static void on_destroy_swapchain(reshade::api::swapchain* swapchain, bool resize) {
     reshade::api::device* dev = swapchain->get_device();
-    if (g_texRead.handle)  { dev->destroy_resource(g_texRead);  g_texRead  = { 0 }; }
-    if (g_texWrite.handle) { dev->destroy_resource(g_texWrite); g_texWrite = { 0 }; }
+    if (g_d3d12ReadbackBuf) { g_d3d12ReadbackBuf->Unmap(0, nullptr); g_d3d12ReadbackBuf->Release(); g_d3d12ReadbackBuf = nullptr; g_mappedReadPtr = nullptr; }
+    if (g_d3d12UploadBuf)   { g_d3d12UploadBuf->Unmap(0, nullptr);   g_d3d12UploadBuf->Release();   g_d3d12UploadBuf   = nullptr; g_mappedWritePtr = nullptr; }
+    if (g_texRead.handle)   { dev->destroy_resource(g_texRead);  g_texRead  = { 0 }; }
+    if (g_texWrite.handle)  { dev->destroy_resource(g_texWrite); g_texWrite = { 0 }; }
     if (fn_cudaFree) {
         if (g_dRgbaRaw) { fn_cudaFree(g_dRgbaRaw); g_dRgbaRaw = nullptr; }
         if (g_dInput)   { fn_cudaFree(g_dInput);   g_dInput   = nullptr; }
