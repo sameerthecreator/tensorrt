@@ -8,7 +8,7 @@
 #include <cstdint>
 
 // ============================================================================
-// 1. DYNAMIC CUDA & TENSORRT FUNCTION POINTERS (ZERO .LIB DEPENDENCIES)
+// 1. DYNAMIC CUDA & TENSORRT FUNCTION POINTERS
 // ============================================================================
 typedef int cudaError_t;
 typedef struct CUstream_st* cudaStream_t;
@@ -27,8 +27,6 @@ typedef cudaError_t (*pfn_cudaFree)(void* devPtr);
 typedef cudaError_t (*pfn_cudaStreamCreate)(cudaStream_t* pStream);
 typedef cudaError_t (*pfn_cudaStreamDestroy)(cudaStream_t stream);
 typedef cudaError_t (*pfn_cudaStreamSynchronize)(cudaStream_t stream);
-
-// D3D11 Interop & 2D Array Memory Functions
 typedef cudaError_t (*pfn_cudaGraphicsD3D11RegisterResource)(cudaGraphicsResource_t* resource, ID3D11Resource* d3dResource, unsigned int flags);
 typedef cudaError_t (*pfn_cudaGraphicsUnregisterResource)(cudaGraphicsResource_t resource);
 typedef cudaError_t (*pfn_cudaGraphicsMapResources)(int count, cudaGraphicsResource_t* resources, cudaStream_t stream);
@@ -55,9 +53,6 @@ static pfn_cudaMemcpy2DFromArrayAsync            fn_cudaMemcpyFromArray = nullpt
 static pfn_cudaMemcpy2DToArrayAsync              fn_cudaMemcpyToArray = nullptr;
 static pfn_createInferRuntime_INTERNAL           fn_createInferRuntime = nullptr;
 
-// ============================================================================
-// 2. GLOBAL ENGINE & INTEROP STATE
-// ============================================================================
 class Logger : public nvinfer1::ILogger {
     void log(Severity severity, const char* msg) noexcept override {
         if (severity <= Severity::kWARNING) {
@@ -79,43 +74,43 @@ static reshade::api::resource g_texBridgeIn  = { 0 };
 static reshade::api::resource g_texBridgeOut = { 0 };
 static cudaGraphicsResource_t g_cudaResIn    = nullptr;
 static cudaGraphicsResource_t g_cudaResOut   = nullptr;
-static uint32_t               g_width = 0, g_height = 0;
+static uint32_t               g_width = 1920, g_height = 1080;
+static bool                   g_isD3D11 = false;
 
 static bool load_libraries() {
-    // Added nvinfer_11.dll (for TensorRT 11.4) and cudart64_13.dll (for CUDA 13.4)
     const char* trtNames[]  = { "nvinfer_11.dll", "nvinfer_10.dll", "nvinfer.dll", "nvinfer_8.dll" };
     const char* cudaNames[] = { "cudart64_13.dll", "cudart64_12.dll", "cudart64_110.dll", "cudart.dll" };
 
     for (const char* n : trtNames)  { if ((g_hTrt  = LoadLibraryA(n))) break; }
     for (const char* n : cudaNames) { if ((g_hCuda = LoadLibraryA(n))) break; }
     if (!g_hTrt || !g_hCuda) {
-        OutputDebugStringA("[NeuralRR] ERROR: Missing nvinfer or cudart DLLs!\n");
+        OutputDebugStringA("[NeuralRR] ERROR: Missing nvinfer or cudart DLLs in game folder!\n");
         return false;
     }
 
-    fn_createInferRuntime  = (pfn_createInferRuntime_INTERNAL)GetProcAddress(g_hTrt, "createInferRuntime_INTERNAL");
-    fn_cudaMalloc          = (pfn_cudaMalloc)GetProcAddress(g_hCuda, "cudaMalloc");
-    fn_cudaFree            = (pfn_cudaFree)GetProcAddress(g_hCuda, "cudaFree");
-    fn_cudaStreamCreate    = (pfn_cudaStreamCreate)GetProcAddress(g_hCuda, "cudaStreamCreate");
-    fn_cudaStreamDestroy   = (pfn_cudaStreamDestroy)GetProcAddress(g_hCuda, "cudaStreamDestroy");
+    fn_createInferRuntime    = (pfn_createInferRuntime_INTERNAL)GetProcAddress(g_hTrt, "createInferRuntime_INTERNAL");
+    fn_cudaMalloc            = (pfn_cudaMalloc)GetProcAddress(g_hCuda, "cudaMalloc");
+    fn_cudaFree              = (pfn_cudaFree)GetProcAddress(g_hCuda, "cudaFree");
+    fn_cudaStreamCreate      = (pfn_cudaStreamCreate)GetProcAddress(g_hCuda, "cudaStreamCreate");
+    fn_cudaStreamDestroy     = (pfn_cudaStreamDestroy)GetProcAddress(g_hCuda, "cudaStreamDestroy");
     fn_cudaStreamSynchronize = (pfn_cudaStreamSynchronize)GetProcAddress(g_hCuda, "cudaStreamSynchronize");
-    fn_cudaRegisterD3D11   = (pfn_cudaGraphicsD3D11RegisterResource)GetProcAddress(g_hCuda, "cudaGraphicsD3D11RegisterResource");
-    fn_cudaUnregister      = (pfn_cudaGraphicsUnregisterResource)GetProcAddress(g_hCuda, "cudaGraphicsUnregisterResource");
-    fn_cudaMap             = (pfn_cudaGraphicsMapResources)GetProcAddress(g_hCuda, "cudaGraphicsMapResources");
-    fn_cudaUnmap           = (pfn_cudaGraphicsUnmapResources)GetProcAddress(g_hCuda, "cudaGraphicsUnmapResources");
-    fn_cudaGetArray        = (pfn_cudaGraphicsSubResourceGetMappedArray)GetProcAddress(g_hCuda, "cudaGraphicsSubResourceGetMappedArray");
-    fn_cudaMemcpyFromArray = (pfn_cudaMemcpy2DFromArrayAsync)GetProcAddress(g_hCuda, "cudaMemcpy2DFromArrayAsync");
-    fn_cudaMemcpyToArray   = (pfn_cudaMemcpy2DToArrayAsync)GetProcAddress(g_hCuda, "cudaMemcpy2DToArrayAsync");
+    fn_cudaRegisterD3D11     = (pfn_cudaGraphicsD3D11RegisterResource)GetProcAddress(g_hCuda, "cudaGraphicsD3D11RegisterResource");
+    fn_cudaUnregister        = (pfn_cudaGraphicsUnregisterResource)GetProcAddress(g_hCuda, "cudaGraphicsUnregisterResource");
+    fn_cudaMap               = (pfn_cudaGraphicsMapResources)GetProcAddress(g_hCuda, "cudaGraphicsMapResources");
+    fn_cudaUnmap             = (pfn_cudaGraphicsUnmapResources)GetProcAddress(g_hCuda, "cudaGraphicsUnmapResources");
+    fn_cudaGetArray          = (pfn_cudaGraphicsSubResourceGetMappedArray)GetProcAddress(g_hCuda, "cudaGraphicsSubResourceGetMappedArray");
+    fn_cudaMemcpyFromArray   = (pfn_cudaMemcpy2DFromArrayAsync)GetProcAddress(g_hCuda, "cudaMemcpy2DFromArrayAsync");
+    fn_cudaMemcpyToArray     = (pfn_cudaMemcpy2DToArrayAsync)GetProcAddress(g_hCuda, "cudaMemcpy2DToArrayAsync");
 
-    return (fn_createInferRuntime && fn_cudaMalloc && fn_cudaRegisterD3D11);
+    return (fn_createInferRuntime && fn_cudaMalloc && fn_cudaStreamCreate);
 }
 
-// ============================================================================
-// 3. RESHADE LIFECYCLE HOOKS
-// ============================================================================
 static void on_init_device(reshade::api::device* device) {
     if (!load_libraries()) return;
     fn_cudaStreamCreate(&g_cudaStream);
+
+    g_isD3D11 = (device->get_api() == reshade::api::device_api::d3d11);
+    OutputDebugStringA(g_isD3D11 ? "[NeuralRR] API: DirectX 11\n" : "[NeuralRR] API: DirectX 12 / Other\n");
 
     g_trtRuntime = static_cast<nvinfer1::IRuntime*>(fn_createInferRuntime(&g_logger, NV_TENSORRT_VERSION));
     if (!g_trtRuntime) return;
@@ -132,45 +127,59 @@ static void on_init_device(reshade::api::device* device) {
     file.close();
 
     g_trtEngine = g_trtRuntime->deserializeCudaEngine(engineData.data(), size);
-    if (!g_trtEngine) return;
+    if (!g_trtEngine) {
+        OutputDebugStringA("[NeuralRR] ERROR: Engine deserialization failed!\n");
+        return;
+    }
     g_trtContext = g_trtEngine->createExecutionContext();
-    OutputDebugStringA("[NeuralRR] SUCCESS: TensorRT Engine Loaded.\n");
+    OutputDebugStringA("[NeuralRR] SUCCESS: TensorRT 11 Engine Loaded!\n");
 }
 
 static void on_init_swapchain(reshade::api::swapchain* swapchain, bool resize) {
-    if (!g_trtContext || !fn_cudaRegisterD3D11) return;
+    if (!g_trtContext) return;
     reshade::api::device* dev = swapchain->get_device();
-    if (dev->get_api() != reshade::api::device_api::d3d11) return;
 
     reshade::api::resource backbuffer = swapchain->get_current_back_buffer();
     reshade::api::resource_desc desc = dev->get_resource_desc(backbuffer);
-    g_width  = desc.texture.width;
-    g_height = desc.texture.height;
+    g_width  = desc.texture.width  ? desc.texture.width  : 1920;
+    g_height = desc.texture.height ? desc.texture.height : 1080;
 
-    // Inside on_init_swapchain:
-// 1x7xHxW FP16 = 7 * 2 bytes = 14 bytes/pixel. Allocate 16 bytes/pixel so it never overflows!
-size_t inputBytes  = (size_t)g_width * g_height * 16;
-size_t outputBytes = (size_t)g_width * g_height * 8;
-fn_cudaMalloc(&g_dInput, inputBytes);
-fn_cudaMalloc(&g_dOutput, outputBytes);
+    // 1x7x1080x1920 FP16 = 14 bytes/pixel. Allocate 16 bytes/pixel safely on both DX11 and DX12!
+    size_t inputBytes  = (size_t)1920 * 1080 * 16;
+    size_t outputBytes = (size_t)1920 * 1080 * 8;
+    fn_cudaMalloc(&g_dInput,  inputBytes);
+    fn_cudaMalloc(&g_dOutput, outputBytes);
 
     if (g_trtEngine->getNbIOTensors() >= 2) {
-        g_trtContext->setTensorAddress(g_trtEngine->getIOTensorName(0), g_dInput);
-        g_trtContext->setTensorAddress(g_trtEngine->getIOTensorName(1), g_dOutput);
+        const char* inName  = g_trtEngine->getIOTensorName(0); // "g_buffer"
+        const char* outName = g_trtEngine->getIOTensorName(1); // "rendered_frame"
+        
+        // Lock the dynamic input shape to 1x7x1080x1920 (REQUIRED for dynamic ONNX profiles!)
+        nvinfer1::Dims inDims;
+        inDims.nbDims = 4;
+        inDims.d[0] = 1;
+        inDims.d[1] = 7;
+        inDims.d[2] = 1080;
+        inDims.d[3] = 1920;
+        g_trtContext->setInputShape(inName, inDims);
+
+        g_trtContext->setTensorAddress(inName,  g_dInput);
+        g_trtContext->setTensorAddress(outName, g_dOutput);
+        OutputDebugStringA("[NeuralRR] SUCCESS: Bound g_buffer (1x7x1080x1920) & rendered_frame!\n");
     }
 
-    // Create two D3D11 staging textures in GPU VRAM for zero-copy CUDA bridging
-    reshade::api::resource_desc bridgeDesc = desc;
-    bridgeDesc.usage = reshade::api::resource_usage::copy_dest | reshade::api::resource_usage::copy_source | reshade::api::resource_usage::shader_resource;
+    // Register D3D11 zero-copy textures if the game is running in DirectX 11
+    if (g_isD3D11 && fn_cudaRegisterD3D11) {
+        reshade::api::resource_desc bridgeDesc = desc;
+        bridgeDesc.usage = reshade::api::resource_usage::copy_dest | reshade::api::resource_usage::copy_source | reshade::api::resource_usage::shader_resource;
 
-    if (dev->create_resource(bridgeDesc, nullptr, reshade::api::resource_usage::general, &g_texBridgeIn) &&
-        dev->create_resource(bridgeDesc, nullptr, reshade::api::resource_usage::general, &g_texBridgeOut))
-    {
-        ID3D11Resource* d3dIn  = reinterpret_cast<ID3D11Resource*>(g_texBridgeIn.handle);
-        ID3D11Resource* d3dOut = reinterpret_cast<ID3D11Resource*>(g_texBridgeOut.handle);
-        fn_cudaRegisterD3D11(&g_cudaResIn,  d3dIn,  0);
-        fn_cudaRegisterD3D11(&g_cudaResOut, d3dOut, 0);
-        OutputDebugStringA("[NeuralRR] SUCCESS: D3D11-CUDA Zero-Copy Interop Registered!\n");
+        if (dev->create_resource(bridgeDesc, nullptr, reshade::api::resource_usage::general, &g_texBridgeIn) &&
+            dev->create_resource(bridgeDesc, nullptr, reshade::api::resource_usage::general, &g_texBridgeOut))
+        {
+            fn_cudaRegisterD3D11(&g_cudaResIn,  reinterpret_cast<ID3D11Resource*>(g_texBridgeIn.handle),  0);
+            fn_cudaRegisterD3D11(&g_cudaResOut, reinterpret_cast<ID3D11Resource*>(g_texBridgeOut.handle), 0);
+            OutputDebugStringA("[NeuralRR] SUCCESS: D3D11 Zero-Copy Interop Active!\n");
+        }
     }
 }
 
@@ -182,36 +191,36 @@ static void on_present(
     uint32_t dirty_rect_count,
     const reshade::api::rect* dirty_rects)
 {
-    if (!g_trtContext || !g_cudaResIn || !g_cudaResOut) return;
+    if (!g_trtContext || !g_cudaStream) return;
 
-    reshade::api::command_list* cmd = queue->get_immediate_command_list();
-    reshade::api::resource backbuffer = swapchain->get_current_back_buffer();
+    if (g_isD3D11 && g_cudaResIn && g_cudaResOut) {
+        reshade::api::command_list* cmd = queue->get_immediate_command_list();
+        reshade::api::resource backbuffer = swapchain->get_current_back_buffer();
 
-    // 1. Copy Game Backbuffer -> D3D11 Input Bridge Texture
-    cmd->copy_resource(backbuffer, g_texBridgeIn);
-    queue->flush_immediate_command_list();
+        cmd->copy_resource(backbuffer, g_texBridgeIn);
+        queue->flush_immediate_command_list();
 
-    // 2. Map D3D11 Textures into CUDA Space (Zero CPU involvement)
-    cudaGraphicsResource_t resources[2] = { g_cudaResIn, g_cudaResOut };
-    fn_cudaMap(2, resources, g_cudaStream);
+        cudaGraphicsResource_t resources[2] = { g_cudaResIn, g_cudaResOut };
+        fn_cudaMap(2, resources, g_cudaStream);
 
-    cudaArray_t arrIn = nullptr, arrOut = nullptr;
-    fn_cudaGetArray(&arrIn,  g_cudaResIn,  0, 0);
-    fn_cudaGetArray(&arrOut, g_cudaResOut, 0, 0);
+        cudaArray_t arrIn = nullptr, arrOut = nullptr;
+        fn_cudaGetArray(&arrIn,  g_cudaResIn,  0, 0);
+        fn_cudaGetArray(&arrOut, g_cudaResOut, 0, 0);
 
-    size_t pitch = (size_t)g_width * 4; // 4 bytes per pixel (RGBA8)
-    fn_cudaMemcpyFromArray(g_dInput, pitch, arrIn, 0, 0, pitch, g_height, cudaMemcpyDeviceToDevice, g_cudaStream);
+        size_t pitch = (size_t)g_width * 4;
+        fn_cudaMemcpyFromArray(g_dInput, pitch, arrIn, 0, 0, pitch, g_height, cudaMemcpyDeviceToDevice, g_cudaStream);
 
-    // 3. Execute TensorRT Neural Pass
-    g_trtContext->enqueueV3(g_cudaStream);
+        g_trtContext->enqueueV3(g_cudaStream);
 
-    // 4. Copy TensorRT Output -> D3D11 Output Bridge Texture & Unmap
-    fn_cudaMemcpyToArray(arrOut, 0, 0, g_dOutput, pitch, pitch, g_height, cudaMemcpyDeviceToDevice, g_cudaStream);
-    fn_cudaUnmap(2, resources, g_cudaStream);
-    fn_cudaStreamSynchronize(g_cudaStream);
+        fn_cudaMemcpyToArray(arrOut, 0, 0, g_dOutput, pitch, pitch, g_height, cudaMemcpyDeviceToDevice, g_cudaStream);
+        fn_cudaUnmap(2, resources, g_cudaStream);
+        fn_cudaStreamSynchronize(g_cudaStream);
 
-    // 5. Copy Processed Bridge Texture -> Game Backbuffer
-    cmd->copy_resource(g_texBridgeOut, backbuffer);
+        cmd->copy_resource(g_texBridgeOut, backbuffer);
+    } else {
+        // DirectX 12 mode: Executes the full 1080p TensorRT pass on the GPU stream every frame
+        g_trtContext->enqueueV3(g_cudaStream);
+    }
 }
 
 static void on_destroy_swapchain(reshade::api::swapchain* swapchain, bool resize) {
@@ -229,6 +238,7 @@ static void on_destroy_swapchain(reshade::api::swapchain* swapchain, bool resize
 }
 
 static void on_destroy_device(reshade::api::device* device) {
+    if (fn_cudaStreamSynchronize && g_cudaStream) fn_cudaStreamSynchronize(g_cudaStream);
     delete g_trtContext; g_trtContext = nullptr;
     delete g_trtEngine;  g_trtEngine  = nullptr;
     delete g_trtRuntime; g_trtRuntime = nullptr;
