@@ -147,10 +147,12 @@ static void on_init_swapchain(reshade::api::swapchain* swapchain, bool resize) {
     g_width  = desc.texture.width;
     g_height = desc.texture.height;
 
-    // Allocate 8 bytes per pixel so FP16 [1,3,H,W] (6 bytes/px) never overflows VRAM
-    size_t frameBytes = (size_t)g_width * g_height * 8;
-    fn_cudaMalloc(&g_dInput, frameBytes);
-    fn_cudaMalloc(&g_dOutput, frameBytes);
+    // Inside on_init_swapchain:
+// 1x7xHxW FP16 = 7 * 2 bytes = 14 bytes/pixel. Allocate 16 bytes/pixel so it never overflows!
+size_t inputBytes  = (size_t)g_width * g_height * 16;
+size_t outputBytes = (size_t)g_width * g_height * 8;
+fn_cudaMalloc(&g_dInput, inputBytes);
+fn_cudaMalloc(&g_dOutput, outputBytes);
 
     if (g_trtEngine->getNbIOTensors() >= 2) {
         g_trtContext->setTensorAddress(g_trtEngine->getIOTensorName(0), g_dInput);
