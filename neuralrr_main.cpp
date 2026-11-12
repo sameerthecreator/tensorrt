@@ -7,6 +7,10 @@
 #include <vector>
 #include <cstdint>
 #include <cstring>
+#include <cmath>
+
+// Fixes error LNK2001: unresolved external symbol __imp_GetAsyncKeyState
+#pragma comment(lib, "user32.lib")
 
 // ============================================================================
 // 1. DYNAMIC CUDA & TENSORRT FUNCTION POINTERS
@@ -70,7 +74,7 @@ static CUfunction g_fnPack   = nullptr;
 static CUfunction g_fnUnpack = nullptr;
 
 // ============================================================================
-// 2. CUDA C KERNELS (WITH SPLIT-SCREEN SUPPORT)
+// 2. CUDA C KERNELS (WITH ACES TONE-MAPPING, EXPOSURE, CONTRAST & SPLIT-SCREEN)
 // ============================================================================
 static const char* g_cudaKernelSrc = R"(
 extern "C" __device__ unsigned short float_to_fp16(float f) {
@@ -82,6 +86,15 @@ extern "C" __device__ float fp16_to_float(unsigned short h) {
     float ret;
     asm("{ cvt.f32.f16 %0, %1; }" : "=f"(ret) : "h"(h));
     return ret;
+}
+extern "C" __device__ float aces_tonemap(float x) {
+    const float a = 2.51f;
+    const float b = 0.03f;
+    const float c = 2.43f;
+    const float d = 0.59f;
+    const float e = 0.14f;
+    float v = (x * (a * x + b)) / (x * (c * x + d) + e);
+    return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
 }
 
 extern "C" __global__ void pack_sdr2hdr_gbuffer(
@@ -112,20 +125,21 @@ extern "C" __global__ void unpack_hdr_to_rgba(
     unsigned char* __restrict__ rgba_io,
     int total_pixels,
     int width,
-    int split_screen)
+    int split_screen,
+    int use_aces,
+    float exposure,
+    float contrast)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total_pixels) return;
 
     int x = idx % width;
     if (split_screen && x < (width / 2)) {
-        // Keep original game pixel on the left half of the screen
         return;
     }
 
     int rgba_idx = idx * 4;
     if (split_screen && (x == (width / 2) || x == (width / 2) + 1)) {
-        // Draw a 2px white vertical divider line down the center
         rgba_io[rgba_idx + 0] = 255;
         rgba_io[rgba_idx + 1] = 255;
         rgba_io[rgba_idx + 2] = 255;
@@ -133,9 +147,24 @@ extern "C" __global__ void unpack_hdr_to_rgba(
         return;
     }
 
-    float r = fp16_to_float(hdr_in[0 * total_pixels + idx]);
-    float g = fp16_to_float(hdr_in[1 * total_pixels + idx]);
-    float b = fp16_to_float(hdr_in[2 * total_pixels + idx]);
+    float r = fp16_to_float(hdr_in[0 * total_pixels + idx]) * exposure;
+    float g = fp16_to_float(hdr_in[1 * total_pixels + idx]) * exposure;
+    float b = fp16_to_float(hdr_in[2 * total_pixels + idx]) * exposure;
+
+    if (r < 0.0f) r = 0.0f;
+    if (g < 0.0f) g = 0.0f;
+    if (b < 0.0f) b = 0.0f;
+
+    if (use_aces) {
+        r = aces_tonemap(r);
+        g = aces_tonemap(g);
+        b = aces_tonemap(b);
+    }
+
+    // Apply midtone contrast curve around 0.5
+    r = (r - 0.5f) * contrast + 0.5f;
+    g = (g - 0.5f) * contrast + 0.5f;
+    b = (b - 0.5f) * contrast + 0.5f;
 
     r = r < 0.0f ? 0.0f : (r > 1.0f ? 1.0f : r);
     g = g < 0.0f ? 0.0f : (g > 1.0f ? 1.0f : g);
@@ -166,9 +195,13 @@ static inline float cpu_f16_to_f32(uint16_t h) {
     uint32_t x = sign | (exp << 23) | (mant << 13);
     return *(float*)&x;
 }
+static inline float cpu_aces(float x) {
+    float v = (x * (2.51f * x + 0.03f)) / (x * (2.43f * x + 0.59f) + 0.14f);
+    return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+}
 
 // ============================================================================
-// 3. GLOBAL STATE & HOTKEY TOGGLES
+// 3. GLOBAL STATE & HOTKEY ADJUSTERS
 // ============================================================================
 class Logger : public nvinfer1::ILogger {
     void log(Severity severity, const char* msg) noexcept override {
@@ -194,28 +227,90 @@ static uint32_t               g_width = 1920, g_height = 1080;
 static std::vector<uint16_t>  g_cpuGbuf;
 static std::vector<uint16_t>  g_cpuOut;
 
-// Hotkey States (F11 = Master Enable/Disable, F10 = 50/50 Split-Screen)
-static bool g_enableNeural = true;
-static bool g_splitScreen  = false;
-static bool g_f11WasDown   = false;
-static bool g_f10WasDown   = false;
+// Toggles & Live Adjusters
+static bool  g_enableNeural = true;
+static bool  g_splitScreen  = false;
+static bool  g_useAces      = true;
+static float g_exposure     = 1.0f;
+static float g_contrast     = 1.0f;
+
+static bool g_f11WasDown  = false;
+static bool g_f10WasDown  = false;
+static bool g_f9WasDown   = false;
+static bool g_pgUpWasDown = false;
+static bool g_pgDnWasDown = false;
+static bool g_homeWasDown = false;
+static bool g_endWasDown  = false;
+static bool g_bsWasDown   = false;
 
 static void poll_hotkeys() {
-    bool f11Down = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
-    if (f11Down && !g_f11WasDown) {
+    // F11: Master Enable / Disable
+    bool f11 = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
+    if (f11 && !g_f11WasDown) {
         g_enableNeural = !g_enableNeural;
         Beep(g_enableNeural ? 800 : 400, 60);
-        OutputDebugStringA(g_enableNeural ? "[NeuralRR] F11: Neural Shader ENABLED\n" : "[NeuralRR] F11: Neural Shader DISABLED (Native FPS)\n");
     }
-    g_f11WasDown = f11Down;
+    g_f11WasDown = f11;
 
-    bool f10Down = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
-    if (f10Down && !g_f10WasDown) {
+    // F10: 50/50 Split-Screen
+    bool f10 = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+    if (f10 && !g_f10WasDown) {
         g_splitScreen = !g_splitScreen;
         Beep(g_splitScreen ? 1000 : 500, 60);
-        OutputDebugStringA(g_splitScreen ? "[NeuralRR] F10: Split-Screen Comparison ON\n" : "[NeuralRR] F10: Full-Screen Neural Mode ON\n");
     }
-    g_f10WasDown = f10Down;
+    g_f10WasDown = f10;
+
+    // F9: Toggle ACES Filmic Tone-Mapping vs Linear Clamp
+    bool f9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+    if (f9 && !g_f9WasDown) {
+        g_useAces = !g_useAces;
+        Beep(g_useAces ? 900 : 450, 60);
+    }
+    g_f9WasDown = f9;
+
+    // Page Up / Page Down: Exposure +/- 0.15
+    bool pgUp = (GetAsyncKeyState(VK_PRIOR) & 0x8000) != 0;
+    if (pgUp && !g_pgUpWasDown) {
+        g_exposure += 0.15f;
+        if (g_exposure > 4.0f) g_exposure = 4.0f;
+        Beep(700, 30);
+    }
+    g_pgUpWasDown = pgUp;
+
+    bool pgDn = (GetAsyncKeyState(VK_NEXT) & 0x8000) != 0;
+    if (pgDn && !g_pgDnWasDown) {
+        g_exposure -= 0.15f;
+        if (g_exposure < 0.15f) g_exposure = 0.15f;
+        Beep(550, 30);
+    }
+    g_pgDnWasDown = pgDn;
+
+    // Ctrl + Home / Ctrl + End: Contrast +/- 0.08
+    bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+    bool home = ctrl && ((GetAsyncKeyState(VK_HOME) & 0x8000) != 0);
+    if (home && !g_homeWasDown) {
+        g_contrast += 0.08f;
+        if (g_contrast > 2.5f) g_contrast = 2.5f;
+        Beep(750, 30);
+    }
+    g_homeWasDown = home;
+
+    bool endKey = ctrl && ((GetAsyncKeyState(VK_END) & 0x8000) != 0);
+    if (endKey && !g_endWasDown) {
+        g_contrast -= 0.08f;
+        if (g_contrast < 0.4f) g_contrast = 0.4f;
+        Beep(500, 30);
+    }
+    g_endWasDown = endKey;
+
+    // Ctrl + Backspace: Reset Exposure & Contrast to 1.0
+    bool bs = ctrl && ((GetAsyncKeyState(VK_BACK) & 0x8000) != 0);
+    if (bs && !g_bsWasDown) {
+        g_exposure = 1.0f;
+        g_contrast = 1.0f;
+        Beep(600, 80);
+    }
+    g_bsWasDown = bs;
 }
 
 static void try_compile_gpu_kernels() {
@@ -349,7 +444,6 @@ static void on_present(
     uint32_t dirty_rect_count,
     const reshade::api::rect* dirty_rects)
 {
-    // Poll F11 (Enable/Disable) and F10 (Split-Screen) every frame
     poll_hotkeys();
     if (!g_enableNeural) return;
 
@@ -362,6 +456,9 @@ static void on_present(
     int totalPixels = 1920 * 1080;
     int width       = 1920;
     int splitFlag   = g_splitScreen ? 1 : 0;
+    int acesFlag    = g_useAces ? 1 : 0;
+    float expVal    = g_exposure;
+    float conVal    = g_contrast;
     size_t rowBytes = 1920 * 4;
 
     cmd->copy_resource(backbuffer, g_texRead);
@@ -382,7 +479,7 @@ static void on_present(
 
         g_trtContext->enqueueV3(g_cudaStream);
 
-        void* unpackArgs[] = { &g_dOutput, &g_dRgbaRaw, &totalPixels, &width, &splitFlag };
+        void* unpackArgs[] = { &g_dOutput, &g_dRgbaRaw, &totalPixels, &width, &splitFlag, &acesFlag, &expVal, &conVal };
         fn_cuLaunchKernel(g_fnUnpack, blocks, 1, 1, threads, 1, 1, 0, g_cudaStream, unpackArgs, nullptr);
 
         if (dev->map_texture_region(g_texWrite, 0, nullptr, reshade::api::map_access::write_only, &mapOut)) {
@@ -430,9 +527,17 @@ static void on_present(
                         continue;
                     }
                     int idx = y * 1920 + x;
-                    float r = cpu_f16_to_f32(g_cpuOut[0 * totalPixels + idx]);
-                    float g = cpu_f16_to_f32(g_cpuOut[1 * totalPixels + idx]);
-                    float b = cpu_f16_to_f32(g_cpuOut[2 * totalPixels + idx]);
+                    float r = cpu_f16_to_f32(g_cpuOut[0 * totalPixels + idx]) * expVal;
+                    float g = cpu_f16_to_f32(g_cpuOut[1 * totalPixels + idx]) * expVal;
+                    float b = cpu_f16_to_f32(g_cpuOut[2 * totalPixels + idx]) * expVal;
+                    if (g_useAces) {
+                        r = cpu_aces(r);
+                        g = cpu_aces(g);
+                        b = cpu_aces(b);
+                    }
+                    r = (r - 0.5f) * conVal + 0.5f;
+                    g = (g - 0.5f) * conVal + 0.5f;
+                    b = (b - 0.5f) * conVal + 0.5f;
                     r = r < 0.0f ? 0.0f : (r > 1.0f ? 1.0f : r);
                     g = g < 0.0f ? 0.0f : (g > 1.0f ? 1.0f : g);
                     b = b < 0.0f ? 0.0f : (b > 1.0f ? 1.0f : b);
