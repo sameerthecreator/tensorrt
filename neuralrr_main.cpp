@@ -82,8 +82,9 @@ static cudaGraphicsResource_t g_cudaResOut   = nullptr;
 static uint32_t               g_width = 0, g_height = 0;
 
 static bool load_libraries() {
-    const char* trtNames[]  = { "nvinfer_10.dll", "nvinfer.dll", "nvinfer_8.dll" };
-    const char* cudaNames[] = { "cudart64_12.dll", "cudart64_110.dll", "cudart.dll" };
+    // Added nvinfer_11.dll (for TensorRT 11.4) and cudart64_13.dll (for CUDA 13.4)
+    const char* trtNames[]  = { "nvinfer_11.dll", "nvinfer_10.dll", "nvinfer.dll", "nvinfer_8.dll" };
+    const char* cudaNames[] = { "cudart64_13.dll", "cudart64_12.dll", "cudart64_110.dll", "cudart.dll" };
 
     for (const char* n : trtNames)  { if ((g_hTrt  = LoadLibraryA(n))) break; }
     for (const char* n : cudaNames) { if ((g_hCuda = LoadLibraryA(n))) break; }
@@ -146,8 +147,8 @@ static void on_init_swapchain(reshade::api::swapchain* swapchain, bool resize) {
     g_width  = desc.texture.width;
     g_height = desc.texture.height;
 
-    // Allocate raw VRAM tensor buffers (Assuming RGBA8 or FP16x4 byte layout; 4 bytes/pixel for RGBA8)
-    size_t frameBytes = (size_t)g_width * g_height * 4;
+    // Allocate 8 bytes per pixel so FP16 [1,3,H,W] (6 bytes/px) never overflows VRAM
+    size_t frameBytes = (size_t)g_width * g_height * 8;
     fn_cudaMalloc(&g_dInput, frameBytes);
     fn_cudaMalloc(&g_dOutput, frameBytes);
 
