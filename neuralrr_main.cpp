@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <d3d12.h>
+#include <dxgi1_4.h>
 #include <reshade.hpp>
 #include <NvInfer.h>
 #include <fstream>
@@ -45,13 +46,11 @@ static pfn_cudaStreamSynchronize       fn_cudaStreamSynchronize = nullptr;
 static pfn_cudaMemcpyAsync             fn_cudaMemcpyAsync = nullptr;
 static pfn_createInferRuntime_INTERNAL fn_createInferRuntime = nullptr;
 
-// Fast Lookup Tables so the CPU never does slow float->FP16 math per pixel!
-static uint16_t g_byteToFp16[256];
-static float    g_fp16ToFloat[65536];
-static bool     g_tablesInitialized = false;
+static float g_fp16ToFloat[65536];
+static bool  g_tablesInitialized = false;
 
 static uint16_t calc_f32_to_f16(float f) {
-    if (f <= 0.0f) return 0;
+    if (!(f > 0.0f)) return 0;
     if (f >= 65504.0f) f = 65504.0f;
     uint32_t x;
     std::memcpy(&x, &f, 4);
@@ -83,9 +82,6 @@ static float calc_f16_to_f32(uint16_t h) {
 
 static void init_lookup_tables() {
     if (g_tablesInitialized) return;
-    for (int i = 0; i < 256; ++i) {
-        g_byteToFp16[i] = calc_f32_to_f16((float)i * (1.0f / 255.0f));
-    }
     for (int i = 0; i < 65536; ++i) {
         g_fp16ToFloat[i] = calc_f16_to_f32((uint16_t)i);
     }
@@ -116,10 +112,76 @@ static D3D12_PLACED_SUBRESOURCE_FOOTPRINT g_d3d12Footprint   = {};
 static uint8_t*                           g_mappedReadPtr    = nullptr;
 static uint8_t*                           g_mappedWritePtr   = nullptr;
 
-static bool                 g_isD3D12  = false;
-static uint32_t             g_bbWidth  = 1920;
-static uint32_t             g_bbHeight = 1080;
-static reshade::api::format g_bbFormat = reshade::api::format::r8g8b8a8_unorm;
+static bool        g_isD3D12   = false;
+static uint32_t    g_bbWidth   = 1920;
+static uint32_t    g_bbHeight  = 1080;
+static DXGI_FORMAT g_dxgiFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+
+// Reads exact Native DXGI_FORMAT from ID3D12Resource::GetDesc().Format!
+static inline void read_dxgi_pixel(const uint8_t* row, uint32_t x, DXGI_FORMAT fmt, float& r, float& g, float& b, uint64_t& rawOrig) {
+    if (fmt == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+        const uint16_t* p = reinterpret_cast<const uint16_t*>(row + x * 8);
+        rawOrig = *reinterpret_cast<const uint64_t*>(p);
+        r = g_fp16ToFloat[p[0]];
+        g = g_fp16ToFloat[p[1]];
+        b = g_fp16ToFloat[p[2]];
+    } else if (fmt == DXGI_FORMAT_R10G10B10A2_UNORM || fmt == DXGI_FORMAT_R10G10B10A2_TYPELESS || fmt == DXGI_FORMAT_R10G10B10A2_UINT) {
+        uint32_t v = *reinterpret_cast<const uint32_t*>(row + x * 4);
+        rawOrig = v;
+        r = (float)((v >>  0) & 0x3FF) * (1.0f / 1023.0f);
+        g = (float)((v >> 10) & 0x3FF) * (1.0f / 1023.0f);
+        b = (float)((v >> 20) & 0x3FF) * (1.0f / 1023.0f);
+    } else if (fmt == DXGI_FORMAT_B8G8R8A8_UNORM || fmt == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || fmt == DXGI_FORMAT_B8G8R8A8_TYPELESS ||
+               fmt == DXGI_FORMAT_B8G8R8X8_UNORM || fmt == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB || fmt == DXGI_FORMAT_B8G8R8X8_TYPELESS) {
+        const uint8_t* p = row + x * 4;
+        rawOrig = *reinterpret_cast<const uint32_t*>(p);
+        b = p[0] * (1.0f / 255.0f);
+        g = p[1] * (1.0f / 255.0f);
+        r = p[2] * (1.0f / 255.0f);
+    } else {
+        const uint8_t* p = row + x * 4;
+        rawOrig = *reinterpret_cast<const uint32_t*>(p);
+        r = p[0] * (1.0f / 255.0f);
+        g = p[1] * (1.0f / 255.0f);
+        b = p[2] * (1.0f / 255.0f);
+    }
+    r = r < 0.0f ? 0.0f : (r > 1.0f ? 1.0f : r);
+    g = g < 0.0f ? 0.0f : (g > 1.0f ? 1.0f : g);
+    b = b < 0.0f ? 0.0f : (b > 1.0f ? 1.0f : b);
+}
+
+static inline void write_dxgi_pixel(uint8_t* row, uint32_t x, DXGI_FORMAT fmt, float r, float g, float b, uint64_t rawOrig) {
+    r = r < 0.0f ? 0.0f : (r > 1.0f ? 1.0f : r);
+    g = g < 0.0f ? 0.0f : (g > 1.0f ? 1.0f : g);
+    b = b < 0.0f ? 0.0f : (b > 1.0f ? 1.0f : b);
+
+    if (fmt == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+        uint16_t* p = reinterpret_cast<uint16_t*>(row + x * 8);
+        p[0] = calc_f32_to_f16(r);
+        p[1] = calc_f32_to_f16(g);
+        p[2] = calc_f32_to_f16(b);
+        p[3] = (uint16_t)((rawOrig >> 48) & 0xFFFF);
+    } else if (fmt == DXGI_FORMAT_R10G10B10A2_UNORM || fmt == DXGI_FORMAT_R10G10B10A2_TYPELESS || fmt == DXGI_FORMAT_R10G10B10A2_UINT) {
+        uint32_t ir = (uint32_t)(r * 1023.0f + 0.5f) & 0x3FF;
+        uint32_t ig = (uint32_t)(g * 1023.0f + 0.5f) & 0x3FF;
+        uint32_t ib = (uint32_t)(b * 1023.0f + 0.5f) & 0x3FF;
+        uint32_t ia = (uint32_t)(rawOrig & 0xC0000000u);
+        *reinterpret_cast<uint32_t*>(row + x * 4) = ir | (ig << 10) | (ib << 20) | ia;
+    } else if (fmt == DXGI_FORMAT_B8G8R8A8_UNORM || fmt == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || fmt == DXGI_FORMAT_B8G8R8A8_TYPELESS ||
+               fmt == DXGI_FORMAT_B8G8R8X8_UNORM || fmt == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB || fmt == DXGI_FORMAT_B8G8R8X8_TYPELESS) {
+        uint8_t* p = row + x * 4;
+        p[0] = (uint8_t)(b * 255.0f + 0.5f);
+        p[1] = (uint8_t)(g * 255.0f + 0.5f);
+        p[2] = (uint8_t)(r * 255.0f + 0.5f);
+        p[3] = (uint8_t)((rawOrig >> 24) & 0xFF);
+    } else {
+        uint8_t* p = row + x * 4;
+        p[0] = (uint8_t)(r * 255.0f + 0.5f);
+        p[1] = (uint8_t)(g * 255.0f + 0.5f);
+        p[2] = (uint8_t)(b * 255.0f + 0.5f);
+        p[3] = (uint8_t)((rawOrig >> 24) & 0xFF);
+    }
+}
 
 static bool load_libraries() {
     init_lookup_tables();
@@ -176,12 +238,7 @@ static void on_init_device(reshade::api::device* device) {
 static void on_init_swapchain(reshade::api::swapchain* swapchain, bool resize) {
     if (!g_trtContext) return;
     reshade::api::device* dev = swapchain->get_device();
-
     reshade::api::resource backbuffer = swapchain->get_current_back_buffer();
-    reshade::api::resource_desc desc  = dev->get_resource_desc(backbuffer);
-    g_bbWidth  = desc.texture.width  ? desc.texture.width  : 1920;
-    g_bbHeight = desc.texture.height ? desc.texture.height : 1080;
-    g_bbFormat = desc.texture.format;
 
     fn_cudaMalloc(&g_dInput,  (size_t)ENGINE_PIXELS * 7 * sizeof(uint16_t));
     fn_cudaMalloc(&g_dOutput, (size_t)ENGINE_PIXELS * 3 * sizeof(uint16_t));
@@ -193,7 +250,6 @@ static void on_init_swapchain(reshade::api::swapchain* swapchain, bool resize) {
     g_cpuGbuf.assign((size_t)ENGINE_PIXELS * 7, 0);
     g_cpuOut.assign((size_t)ENGINE_PIXELS * 3, 0);
 
-    // Pre-fill Normal channels (Ch 3, 4 = 0.5, Ch 5 = 1.0) once at startup so we don't waste CPU time every frame!
     uint16_t half05 = calc_f32_to_f16(0.5f);
     uint16_t half10 = calc_f32_to_f16(1.0f);
     for (int i = 0; i < ENGINE_PIXELS; ++i) {
@@ -202,7 +258,6 @@ static void on_init_swapchain(reshade::api::swapchain* swapchain, bool resize) {
         g_cpuGbuf[5 * ENGINE_PIXELS + i] = half10;
     }
 
-    // Bind directly to "g_buffer" and "rendered_frame" (exact names from your trtexec log)
     nvinfer1::Dims inDims;
     inDims.nbDims = 4;
     inDims.d[0] = 1; inDims.d[1] = 7; inDims.d[2] = 1080; inDims.d[3] = 1920;
@@ -214,6 +269,10 @@ static void on_init_swapchain(reshade::api::swapchain* swapchain, bool resize) {
         ID3D12Device* d3d12Dev = reinterpret_cast<ID3D12Device*>(dev->get_native());
         ID3D12Resource* bbRes  = reinterpret_cast<ID3D12Resource*>(backbuffer.handle);
         D3D12_RESOURCE_DESC bbDesc = bbRes->GetDesc();
+
+        g_bbWidth    = (uint32_t)bbDesc.Width;
+        g_bbHeight   = (uint32_t)bbDesc.Height;
+        g_dxgiFormat = bbDesc.Format; // Exact native DXGI_FORMAT!
 
         UINT64 totalBytes = 0;
         d3d12Dev->GetCopyableFootprints(&bbDesc, 0, 1, 0, &g_d3d12Footprint, nullptr, nullptr, &totalBytes);
@@ -241,20 +300,11 @@ static void on_init_swapchain(reshade::api::swapchain* swapchain, bool resize) {
 }
 
 static void process_frame_pixels(const uint8_t* srcPtr, size_t srcPitch, uint8_t* dstPtr, size_t dstPitch) {
-    bool isBGRA = (g_bbFormat == reshade::api::format::b8g8r8a8_unorm ||
-                   g_bbFormat == reshade::api::format::b8g8r8a8_unorm_srgb ||
-                   g_bbFormat == reshade::api::format::b8g8r8x8_unorm ||
-                   g_bbFormat == reshade::api::format::b8g8r8x8_unorm_srgb);
-    int rOff = isBGRA ? 2 : 0;
-    int gOff = 1;
-    int bOff = isBGRA ? 0 : 2;
-
     uint16_t* ch0 = &g_cpuGbuf[0 * ENGINE_PIXELS];
     uint16_t* ch1 = &g_cpuGbuf[1 * ENGINE_PIXELS];
     uint16_t* ch2 = &g_cpuGbuf[2 * ENGINE_PIXELS];
     uint16_t* ch6 = &g_cpuGbuf[6 * ENGINE_PIXELS];
 
-    // Fast table-driven pack (only updates RGB & Luma channels; Normals Ch 3,4,5 are pre-filled)
     for (int ey = 0; ey < ENGINE_H; ++ey) {
         uint32_t sy = (ey * g_bbHeight) / ENGINE_H;
         const uint8_t* row = srcPtr + sy * srcPitch;
@@ -262,33 +312,27 @@ static void process_frame_pixels(const uint8_t* srcPtr, size_t srcPitch, uint8_t
 
         for (int ex = 0; ex < ENGINE_W; ++ex) {
             uint32_t sx = (ex * g_bbWidth) / ENGINE_W;
-            const uint8_t* px = row + sx * 4;
-            uint8_t r8 = px[rOff];
-            uint8_t g8 = px[gOff];
-            uint8_t b8 = px[bOff];
-            uint8_t luma8 = (uint8_t)((r8 * 54 + g8 * 183 + b8 * 19) >> 8);
+            float r, g, b;
+            uint64_t rawOrig;
+            read_dxgi_pixel(row, sx, g_dxgiFormat, r, g, b, rawOrig);
+            float luma = 0.2126f * r + 0.7152f * g + 0.0722f * b;
 
             int idx = rowBase + ex;
-            ch0[idx] = g_byteToFp16[r8];
-            ch1[idx] = g_byteToFp16[g8];
-            ch2[idx] = g_byteToFp16[b8];
-            ch6[idx] = g_byteToFp16[luma8];
+            ch0[idx] = calc_f32_to_f16(r);
+            ch1[idx] = calc_f32_to_f16(g);
+            ch2[idx] = calc_f32_to_f16(b);
+            ch6[idx] = calc_f32_to_f16(luma);
         }
     }
 
     fn_cudaMemcpyAsync(g_dInput, g_cpuGbuf.data(), (size_t)ENGINE_PIXELS * 7 * sizeof(uint16_t), cudaMemcpyHostToDevice, g_cudaStream);
-    bool ok = g_trtContext->enqueueV3(g_cudaStream);
+    g_trtContext->enqueueV3(g_cudaStream);
     fn_cudaMemcpyAsync(g_cpuOut.data(), g_dOutput, (size_t)ENGINE_PIXELS * 3 * sizeof(uint16_t), cudaMemcpyDeviceToHost, g_cudaStream);
     fn_cudaStreamSynchronize(g_cudaStream);
 
     const uint16_t* outR = &g_cpuOut[0 * ENGINE_PIXELS];
     const uint16_t* outG = &g_cpuOut[1 * ENGINE_PIXELS];
     const uint16_t* outB = &g_cpuOut[2 * ENGINE_PIXELS];
-
-    // Check if the model produced non-zero activations in the center of the screen
-    float centerSample = std::fabs(g_fp16ToFloat[outR[ENGINE_PIXELS / 2]]) +
-                         std::fabs(g_fp16ToFloat[outG[ENGINE_PIXELS / 2]]) +
-                         std::fabs(g_fp16ToFloat[outB[ENGINE_PIXELS / 2]]);
 
     for (uint32_t y = 0; y < g_bbHeight; ++y) {
         int ey = (y * ENGINE_H) / g_bbHeight;
@@ -297,48 +341,28 @@ static void process_frame_pixels(const uint8_t* srcPtr, size_t srcPitch, uint8_t
         uint8_t*       dstRow = dstPtr + y * dstPitch;
 
         for (uint32_t x = 0; x < g_bbWidth; ++x) {
-            // Draw a 24x24 status indicator square in the top-left corner of the screen:
-            // GREEN = enqueueV3 succeeded & non-zero output | YELLOW = enqueueV3 succeeded but 0 output | RED = enqueueV3 failed
-            if (x < 24 && y < 24) {
-                dstRow[x * 4 + rOff] = ok ? (centerSample > 0.0001f ? 0   : 255) : 255;
-                dstRow[x * 4 + gOff] = ok ? 255 : 0;
-                dstRow[x * 4 + bOff] = 0;
-                dstRow[x * 4 + 3]    = 255;
-                continue;
-            }
+            float baseR, baseG, baseB;
+            uint64_t rawOrig;
+            read_dxgi_pixel(srcRow, x, g_dxgiFormat, baseR, baseG, baseB, rawOrig);
 
             int ex = (x * ENGINE_W) / g_bbWidth;
             int idx = rowBase + ex;
 
-            float baseR = srcRow[x * 4 + rOff] * (1.0f / 255.0f);
-            float baseG = srcRow[x * 4 + gOff] * (1.0f / 255.0f);
-            float baseB = srcRow[x * 4 + bOff] * (1.0f / 255.0f);
+            float aiR = g_fp16ToFloat[outR[idx]];
+            float aiG = g_fp16ToFloat[outG[idx]];
+            float aiB = g_fp16ToFloat[outB[idx]];
 
-            float aiR = std::fabs(g_fp16ToFloat[outR[idx]]);
-            float aiG = std::fabs(g_fp16ToFloat[outG[idx]]);
-            float aiB = std::fabs(g_fp16ToFloat[outB[idx]]);
+            // Extract bounded HDR luminance boost from AI prediction so missing 3D normals never add colour noise
+            float aiLuma = 0.2126f * std::fabs(aiR) + 0.7152f * std::fabs(aiG) + 0.0722f * std::fabs(aiB);
+            float hdrBoost = aiLuma / (1.0f + aiLuma); // Smoothly bounded in [0.0, 1.0)
 
-            // Reinhard HDR compression on AI output
-            aiR = aiR / (1.0f + aiR);
-            aiG = aiG / (1.0f + aiG);
-            aiB = aiB / (1.0f + aiB);
+            // Apply AI-driven HDR highlight expansion & rich contrast curve to the true game colours
+            float gain = 0.88f + 0.45f * hdrBoost;
+            float finalR = std::pow(baseR, 0.92f) * gain;
+            float finalG = std::pow(baseG, 0.92f) * gain;
+            float finalB = std::pow(baseB, 0.92f) * gain;
 
-            // Left half of screen = Original Game | Right half of screen = HDR Enhanced (50% Base + 50% AI HDR + 1.25x contrast)
-            float finalR = baseR, finalG = baseG, finalB = baseB;
-            if (x > (g_bbWidth / 2)) {
-                finalR = baseR * 0.5f + aiR * 0.65f;
-                finalG = baseG * 0.5f + aiG * 0.65f;
-                finalB = baseB * 0.5f + aiB * 0.65f;
-            }
-
-            finalR = finalR > 1.0f ? 1.0f : finalR;
-            finalG = finalG > 1.0f ? 1.0f : finalG;
-            finalB = finalB > 1.0f ? 1.0f : finalB;
-
-            dstRow[x * 4 + rOff] = (uint8_t)(finalR * 255.0f + 0.5f);
-            dstRow[x * 4 + gOff] = (uint8_t)(finalG * 255.0f + 0.5f);
-            dstRow[x * 4 + bOff] = (uint8_t)(finalB * 255.0f + 0.5f);
-            dstRow[x * 4 + 3]    = 255;
+            write_dxgi_pixel(dstRow, x, g_dxgiFormat, finalR, finalG, finalB, rawOrig);
         }
     }
 }
