@@ -8,6 +8,7 @@
 #include <vector>
 #include <cstdint>
 #include <cstring>
+#include <cmath>
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -16,10 +17,7 @@
 // 1. DYNAMIC CUDA & TENSORRT FUNCTION POINTERS
 // ============================================================================
 typedef int cudaError_t;
-typedef int CUresult;
 typedef struct CUstream_st* cudaStream_t;
-typedef struct CUmod_st* CUmodule;
-typedef struct CUfunc_st* CUfunction;
 
 enum cudaMemcpyKind {
     cudaMemcpyHostToHost = 0,
@@ -29,116 +27,30 @@ enum cudaMemcpyKind {
 };
 
 typedef cudaError_t (*pfn_cudaMalloc)(void** devPtr, size_t size);
+typedef cudaError_t (*pfn_cudaMemset)(void* devPtr, int value, size_t count);
 typedef cudaError_t (*pfn_cudaFree)(void* devPtr);
 typedef cudaError_t (*pfn_cudaStreamCreate)(cudaStream_t* pStream);
 typedef cudaError_t (*pfn_cudaStreamDestroy)(cudaStream_t stream);
 typedef cudaError_t (*pfn_cudaStreamSynchronize)(cudaStream_t stream);
 typedef cudaError_t (*pfn_cudaMemcpyAsync)(void* dst, const void* src, size_t count, cudaMemcpyKind kind, cudaStream_t stream);
-typedef cudaError_t (*pfn_cudaMemcpy2DAsync)(void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height, cudaMemcpyKind kind, cudaStream_t stream);
 typedef void* (*pfn_createInferRuntime_INTERNAL)(void* logger, int32_t version);
 
-typedef CUresult (*pfn_cuInit)(unsigned int Flags);
-typedef CUresult (*pfn_cuModuleLoadData)(CUmodule* module, const void* image);
-typedef CUresult (*pfn_cuModuleGetFunction)(CUfunction* hfunc, CUmodule hmod, const char* name);
-typedef CUresult (*pfn_cuLaunchKernel)(CUfunction f, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ, unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ, unsigned int sharedMemBytes, cudaStream_t hStream, void** kernelParams, void** extra);
-
-typedef struct _nvrtcProgram* nvrtcProgram;
-typedef int nvrtcResult;
-typedef nvrtcResult (*pfn_nvrtcCreateProgram)(nvrtcProgram* prog, const char* src, const char* name, int numHeaders, const char* const* headers, const char* const* includeNames);
-typedef nvrtcResult (*pfn_nvrtcCompileProgram)(nvrtcProgram prog, int numOptions, const char* const* options);
-typedef nvrtcResult (*pfn_nvrtcGetPTXSize)(nvrtcProgram prog, size_t* ptxSizeRet);
-typedef nvrtcResult (*pfn_nvrtcGetPTX)(nvrtcProgram prog, char* ptx);
-typedef nvrtcResult (*pfn_nvrtcDestroyProgram)(nvrtcProgram* prog);
-
-static HMODULE g_hCuda   = nullptr;
-static HMODULE g_hTrt    = nullptr;
-static HMODULE g_hNvCuda = nullptr;
-static HMODULE g_hNvrtc  = nullptr;
+static HMODULE g_hCuda = nullptr;
+static HMODULE g_hTrt  = nullptr;
 
 static pfn_cudaMalloc                  fn_cudaMalloc = nullptr;
+static pfn_cudaMemset                  fn_cudaMemset = nullptr;
 static pfn_cudaFree                    fn_cudaFree = nullptr;
 static pfn_cudaStreamCreate            fn_cudaStreamCreate = nullptr;
 static pfn_cudaStreamDestroy           fn_cudaStreamDestroy = nullptr;
 static pfn_cudaStreamSynchronize       fn_cudaStreamSynchronize = nullptr;
 static pfn_cudaMemcpyAsync             fn_cudaMemcpyAsync = nullptr;
-static pfn_cudaMemcpy2DAsync           fn_cudaMemcpy2DAsync = nullptr;
 static pfn_createInferRuntime_INTERNAL fn_createInferRuntime = nullptr;
 
-static pfn_cuInit              fn_cuInit = nullptr;
-static pfn_cuModuleLoadData    fn_cuModuleLoadData = nullptr;
-static pfn_cuModuleGetFunction fn_cuModuleGetFunction = nullptr;
-static pfn_cuLaunchKernel      fn_cuLaunchKernel = nullptr;
-
-static CUmodule   g_cuMod    = nullptr;
-static CUfunction g_fnPack   = nullptr;
-static CUfunction g_fnUnpack = nullptr;
-
-// ============================================================================
-// 2. GPU FORMAT KERNELS (BGRA8/RGBA8 <-> 1x7x1080x1920 FP16)
-// ============================================================================
-static const char* g_cudaKernelSrc = R"(
-extern "C" __device__ unsigned short float_to_fp16(float f) {
-    unsigned short ret;
-    asm("{ cvt.rn.f16.f32 %0, %1; }" : "=h"(ret) : "f"(f));
-    return ret;
-}
-extern "C" __device__ float fp16_to_float(unsigned short h) {
-    float ret;
-    asm("{ cvt.f32.f16 %0, %1; }" : "=f"(ret) : "h"(h));
-    return ret;
-}
-
-extern "C" __global__ void pack_sdr2hdr_gbuffer(
-    const unsigned char* __restrict__ rgba_in,
-    unsigned short* __restrict__ gbuf_out,
-    int total_pixels)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= total_pixels) return;
-
-    int rgba_idx = idx * 4;
-    // Map [0, 255] to [-1, 1] range required by PyTorch HDR models
-    float r = ((float)rgba_in[rgba_idx + 2] * (1.0f / 255.0f)) * 2.0f - 1.0f;
-    float g = ((float)rgba_in[rgba_idx + 1] * (1.0f / 255.0f)) * 2.0f - 1.0f;
-    float b = ((float)rgba_in[rgba_idx + 0] * (1.0f / 255.0f)) * 2.0f - 1.0f;
-    float luma = 0.2126f * r + 0.7152f * g + 0.0722f * b;
-
-    gbuf_out[0 * total_pixels + idx] = float_to_fp16(r);
-    gbuf_out[1 * total_pixels + idx] = float_to_fp16(g);
-    gbuf_out[2 * total_pixels + idx] = float_to_fp16(b);
-    gbuf_out[3 * total_pixels + idx] = float_to_fp16(r * r);
-    gbuf_out[4 * total_pixels + idx] = float_to_fp16(g * g);
-    gbuf_out[5 * total_pixels + idx] = float_to_fp16(b * b);
-    gbuf_out[6 * total_pixels + idx] = float_to_fp16(luma);
-}
-
-extern "C" __global__ void unpack_hdr_to_rgba(
-    const unsigned short* __restrict__ hdr_in,
-    unsigned char* __restrict__ rgba_out,
-    int total_pixels)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= total_pixels) return;
-
-    // Convert model output from [-1, 1] back to [0, 1]
-    float r = (fp16_to_float(hdr_in[0 * total_pixels + idx]) + 1.0f) * 0.5f;
-    float g = (fp16_to_float(hdr_in[1 * total_pixels + idx]) + 1.0f) * 0.5f;
-    float b = (fp16_to_float(hdr_in[2 * total_pixels + idx]) + 1.0f) * 0.5f;
-
-    r = r < 0.0f ? 0.0f : (r > 1.0f ? 1.0f : r);
-    g = g < 0.0f ? 0.0f : (g > 1.0f ? 1.0f : g);
-    b = b < 0.0f ? 0.0f : (b > 1.0f ? 1.0f : b);
-
-    int rgba_idx = idx * 4;
-    rgba_out[rgba_idx + 0] = (unsigned char)(b * 255.0f + 0.5f);
-    rgba_out[rgba_idx + 1] = (unsigned char)(g * 255.0f + 0.5f);
-    rgba_out[rgba_idx + 2] = (unsigned char)(r * 255.0f + 0.5f);
-    rgba_out[rgba_idx + 3] = 255;
-}
-)";
-
-static inline uint16_t cpu_f32_to_f16(float f) {
-    uint32_t x = *(uint32_t*)&f;
+// Fast IEEE 754 Float32 <-> Float16 conversion
+static inline uint16_t f32_to_f16(float f) {
+    uint32_t x;
+    std::memcpy(&x, &f, 4);
     uint32_t sign = (x >> 16) & 0x8000;
     int32_t  exp  = ((x >> 23) & 0xff) - 127 + 15;
     uint32_t mant = (x >> 13) & 0x03ff;
@@ -146,22 +58,31 @@ static inline uint16_t cpu_f32_to_f16(float f) {
     if (exp >= 31) return (uint16_t)(sign | 0x7c00);
     return (uint16_t)(sign | (exp << 10) | mant);
 }
-static inline float cpu_f16_to_f32(uint16_t h) {
+
+static inline float f16_to_f32(uint16_t h) {
     uint32_t sign = (h & 0x8000) << 16;
     uint32_t exp  = (h >> 10) & 0x1f;
     uint32_t mant = h & 0x03ff;
-    if (exp == 0) return 0.0f;
-    if (exp == 31) exp = 255; else exp = exp - 15 + 127;
+    if (exp == 0) {
+        if (mant == 0) return 0.0f;
+        while ((mant & 0x0400) == 0) { mant <<= 1; exp--; }
+        exp++; mant &= ~0x0400;
+    } else if (exp == 31) {
+        return 0.0f; // Filter out NaN/Inf from FP16 overflow
+    }
+    exp = exp - 15 + 127;
     uint32_t x = sign | (exp << 23) | (mant << 13);
-    return *(float*)&x;
+    float f;
+    std::memcpy(&f, &x, 4);
+    return f;
 }
 
 // ============================================================================
-// 3. GLOBAL ENGINE & DIRECTX 12 BUFFER STATE
+// 2. GLOBAL ENGINE & DIRECTX 12 STATE
 // ============================================================================
 class Logger : public nvinfer1::ILogger {
     void log(Severity severity, const char* msg) noexcept override {
-        if (severity <= Severity::kWARNING) {
+        if (severity <= Severity::kINFO) {
             OutputDebugStringA("[NeuralRR] ");
             OutputDebugStringA(msg);
             OutputDebugStringA("\n");
@@ -174,60 +95,28 @@ static nvinfer1::ICudaEngine*       g_trtEngine  = nullptr;
 static nvinfer1::IExecutionContext* g_trtContext = nullptr;
 static cudaStream_t                 g_cudaStream = nullptr;
 
-static void*                g_dRgbaRaw = nullptr;
-static void*                g_dInput   = nullptr;
-static void*                g_dOutput  = nullptr;
+static constexpr int ENGINE_W = 1920;
+static constexpr int ENGINE_H = 1080;
+static constexpr int ENGINE_PIXELS = ENGINE_W * ENGINE_H;
+
+static void*                 g_dInput   = nullptr; // g_buffer (1x7x1080x1920 FP16)
+static void*                 g_dAuxIn   = nullptr; // Extra buffer in case model has a 2nd input tensor
+static void*                 g_dOutput  = nullptr; // rendered_frame (1x3x1080x1920 FP16)
 static std::vector<uint16_t> g_cpuGbuf;
 static std::vector<uint16_t> g_cpuOut;
 
-// Native D3D12 Readback & Upload Buffers (Since D3D12 forbids TEXTURE_2D on CPU heaps!)
-static ID3D12Resource*                  g_d3d12ReadbackBuf = nullptr;
-static ID3D12Resource*                  g_d3d12UploadBuf   = nullptr;
-static D3D12_PLACED_SUBRESOURCE_FOOTPRINT g_d3d12Footprint = {};
-static uint8_t*                         g_mappedReadPtr    = nullptr;
-static uint8_t*                         g_mappedWritePtr   = nullptr;
+static ID3D12Resource*                    g_d3d12ReadbackBuf = nullptr;
+static ID3D12Resource*                    g_d3d12UploadBuf   = nullptr;
+static D3D12_PLACED_SUBRESOURCE_FOOTPRINT g_d3d12Footprint   = {};
+static uint8_t*                           g_mappedReadPtr    = nullptr;
+static uint8_t*                           g_mappedWritePtr   = nullptr;
 
-// Fallback ReShade textures for D3D11
 static reshade::api::resource g_texRead  = { 0 };
 static reshade::api::resource g_texWrite = { 0 };
 static bool                   g_isD3D12  = false;
-
-static void try_compile_gpu_kernels() {
-    g_hNvCuda = LoadLibraryA("nvcuda.dll");
-    const char* nvrtcNames[] = { "nvrtc64_130_0.dll", "nvrtc64_120_0.dll", "nvrtc64_112_0.dll", "nvrtc.dll" };
-    for (const char* n : nvrtcNames) { if ((g_hNvrtc = LoadLibraryA(n))) break; }
-    if (!g_hNvCuda || !g_hNvrtc) return;
-
-    fn_cuInit              = (pfn_cuInit)GetProcAddress(g_hNvCuda, "cuInit");
-    fn_cuModuleLoadData    = (pfn_cuModuleLoadData)GetProcAddress(g_hNvCuda, "cuModuleLoadData");
-    fn_cuModuleGetFunction = (pfn_cuModuleGetFunction)GetProcAddress(g_hNvCuda, "cuModuleGetFunction");
-    fn_cuLaunchKernel      = (pfn_cuLaunchKernel)GetProcAddress(g_hNvCuda, "cuLaunchKernel");
-
-    auto fnCreate  = (pfn_nvrtcCreateProgram)GetProcAddress(g_hNvrtc, "nvrtcCreateProgram");
-    auto fnCompile = (pfn_nvrtcCompileProgram)GetProcAddress(g_hNvrtc, "nvrtcCompileProgram");
-    auto fnSize    = (pfn_nvrtcGetPTXSize)GetProcAddress(g_hNvrtc, "nvrtcGetPTXSize");
-    auto fnPtx     = (pfn_nvrtcGetPTX)GetProcAddress(g_hNvrtc, "nvrtcGetPTX");
-    auto fnDestroy = (pfn_nvrtcDestroyProgram)GetProcAddress(g_hNvrtc, "nvrtcDestroyProgram");
-
-    if (!fn_cuModuleLoadData || !fnCreate) return;
-    fn_cuInit(0);
-
-    nvrtcProgram prog = nullptr;
-    if (fnCreate(&prog, g_cudaKernelSrc, "sdr2hdr.cu", 0, nullptr, nullptr) == 0) {
-        const char* opts[] = { "--gpu-architecture=compute_75" };
-        if (fnCompile(prog, 1, opts) == 0) {
-            size_t ptxSize = 0;
-            fnSize(prog, &ptxSize);
-            std::vector<char> ptx(ptxSize);
-            fnPtx(prog, ptx.data());
-            if (fn_cuModuleLoadData(&g_cuMod, ptx.data()) == 0) {
-                fn_cuModuleGetFunction(&g_fnPack,   g_cuMod, "pack_sdr2hdr_gbuffer");
-                fn_cuModuleGetFunction(&g_fnUnpack, g_cuMod, "unpack_hdr_to_rgba");
-            }
-        }
-        fnDestroy(&prog);
-    }
-}
+static uint32_t               g_bbWidth  = 1920;
+static uint32_t               g_bbHeight = 1080;
+static reshade::api::format   g_bbFormat = reshade::api::format::r8g8b8a8_unorm;
 
 static bool load_libraries() {
     const char* trtNames[]  = { "nvinfer_11.dll", "nvinfer_10.dll", "nvinfer.dll", "nvinfer_8.dll" };
@@ -239,15 +128,14 @@ static bool load_libraries() {
 
     fn_createInferRuntime    = (pfn_createInferRuntime_INTERNAL)GetProcAddress(g_hTrt, "createInferRuntime_INTERNAL");
     fn_cudaMalloc            = (pfn_cudaMalloc)GetProcAddress(g_hCuda, "cudaMalloc");
+    fn_cudaMemset            = (pfn_cudaMemset)GetProcAddress(g_hCuda, "cudaMemset");
     fn_cudaFree              = (pfn_cudaFree)GetProcAddress(g_hCuda, "cudaFree");
     fn_cudaStreamCreate      = (pfn_cudaStreamCreate)GetProcAddress(g_hCuda, "cudaStreamCreate");
     fn_cudaStreamDestroy     = (pfn_cudaStreamDestroy)GetProcAddress(g_hCuda, "cudaStreamDestroy");
     fn_cudaStreamSynchronize = (pfn_cudaStreamSynchronize)GetProcAddress(g_hCuda, "cudaStreamSynchronize");
     fn_cudaMemcpyAsync       = (pfn_cudaMemcpyAsync)GetProcAddress(g_hCuda, "cudaMemcpyAsync");
-    fn_cudaMemcpy2DAsync     = (pfn_cudaMemcpy2DAsync)GetProcAddress(g_hCuda, "cudaMemcpy2DAsync");
 
-    try_compile_gpu_kernels();
-    return (fn_createInferRuntime && fn_cudaMalloc && fn_cudaStreamCreate);
+    return (fn_createInferRuntime && fn_cudaMalloc && fn_cudaStreamCreate && fn_cudaMemcpyAsync);
 }
 
 static void on_init_device(reshade::api::device* device) {
@@ -255,7 +143,6 @@ static void on_init_device(reshade::api::device* device) {
     fn_cudaStreamCreate(&g_cudaStream);
     g_isD3D12 = (device->get_api() == reshade::api::device_api::d3d12);
 
-    // Fix Bug 1: Probe exact TensorRT version (110400, NV_TENSORRT_VERSION, etc.) so TRT 11.4 never rejects header version!
     int32_t candidateVersions[] = { 110400, 110300, 110200, 110100, 110000, NV_TENSORRT_VERSION, 100300, 100000 };
     for (int32_t v : candidateVersions) {
         g_trtRuntime = static_cast<nvinfer1::IRuntime*>(fn_createInferRuntime(&g_logger, v));
@@ -286,53 +173,73 @@ static void on_init_swapchain(reshade::api::swapchain* swapchain, bool resize) {
     if (!g_trtContext) return;
     reshade::api::device* dev = swapchain->get_device();
 
-    size_t pixels = (size_t)1920 * 1080;
-    fn_cudaMalloc(&g_dRgbaRaw, pixels * 4);
-    fn_cudaMalloc(&g_dInput,   pixels * 7 * sizeof(uint16_t));
-    fn_cudaMalloc(&g_dOutput,  pixels * 3 * sizeof(uint16_t));
+    reshade::api::resource backbuffer = swapchain->get_current_back_buffer();
+    reshade::api::resource_desc desc  = dev->get_resource_desc(backbuffer);
+    g_bbWidth  = desc.texture.width  ? desc.texture.width  : 1920;
+    g_bbHeight = desc.texture.height ? desc.texture.height : 1080;
+    g_bbFormat = desc.texture.format;
 
-    if (!g_fnPack) {
-        g_cpuGbuf.resize(pixels * 7);
-        g_cpuOut.resize(pixels * 3);
+    fn_cudaMalloc(&g_dInput,  (size_t)ENGINE_PIXELS * 7 * sizeof(uint16_t));
+    fn_cudaMalloc(&g_dAuxIn,  (size_t)ENGINE_PIXELS * 7 * sizeof(uint16_t));
+    fn_cudaMalloc(&g_dOutput, (size_t)ENGINE_PIXELS * 3 * sizeof(uint16_t));
+    if (fn_cudaMemset) {
+        fn_cudaMemset(g_dInput,  0, (size_t)ENGINE_PIXELS * 7 * sizeof(uint16_t));
+        fn_cudaMemset(g_dAuxIn,  0, (size_t)ENGINE_PIXELS * 7 * sizeof(uint16_t));
+        fn_cudaMemset(g_dOutput, 0, (size_t)ENGINE_PIXELS * 3 * sizeof(uint16_t));
     }
 
-    if (g_trtEngine->getNbIOTensors() >= 2) {
-        const char* inName  = g_trtEngine->getIOTensorName(0);
-        const char* outName = g_trtEngine->getIOTensorName(1);
-        
-        nvinfer1::Dims inDims;
-        inDims.nbDims = 4;
-        inDims.d[0] = 1; inDims.d[1] = 7; inDims.d[2] = 1080; inDims.d[3] = 1920;
-        g_trtContext->setInputShape(inName, inDims);
+    g_cpuGbuf.assign((size_t)ENGINE_PIXELS * 7, 0);
+    g_cpuOut.assign((size_t)ENGINE_PIXELS * 3, 0);
 
-        g_trtContext->setTensorAddress(inName,  g_dInput);
-        g_trtContext->setTensorAddress(outName, g_dOutput);
+    // Fix Bug 1: Bind all inputs and outputs by exact name/role (handles 2-input + 1-output models!)
+    int32_t nbTensors = g_trtEngine->getNbIOTensors();
+    bool boundPrimaryInput = false;
+    for (int32_t i = 0; i < nbTensors; ++i) {
+        const char* name = g_trtEngine->getIOTensorName(i);
+        nvinfer1::TensorIOMode mode = g_trtEngine->getTensorIOMode(name);
+
+        if (mode == nvinfer1::TensorIOMode::kINPUT) {
+            nvinfer1::Dims dims = g_trtEngine->getTensorShape(name);
+            if (dims.nbDims == 4) {
+                nvinfer1::Dims runDims;
+                runDims.nbDims = 4;
+                runDims.d[0] = (dims.d[0] > 0) ? dims.d[0] : 1;
+                runDims.d[1] = (dims.d[1] > 0) ? dims.d[1] : 7;
+                runDims.d[2] = ENGINE_H;
+                runDims.d[3] = ENGINE_W;
+                g_trtContext->setInputShape(name, runDims);
+            }
+            if (std::strcmp(name, "g_buffer") == 0 || !boundPrimaryInput) {
+                g_trtContext->setTensorAddress(name, g_dInput);
+                boundPrimaryInput = true;
+            } else {
+                g_trtContext->setTensorAddress(name, g_dAuxIn);
+            }
+        } else {
+            g_trtContext->setTensorAddress(name, g_dOutput);
+        }
     }
 
-    // Fix Bug 2: In DirectX 12, create native D3D12 Readback & Upload linear buffers (persistent mapped!)
     if (g_isD3D12) {
         ID3D12Device* d3d12Dev = reinterpret_cast<ID3D12Device*>(dev->get_native());
-        ID3D12Resource* bbRes  = reinterpret_cast<ID3D12Resource*>(swapchain->get_current_back_buffer().handle);
+        ID3D12Resource* bbRes  = reinterpret_cast<ID3D12Resource*>(backbuffer.handle);
         D3D12_RESOURCE_DESC bbDesc = bbRes->GetDesc();
 
         UINT64 totalBytes = 0;
         d3d12Dev->GetCopyableFootprints(&bbDesc, 0, 1, 0, &g_d3d12Footprint, nullptr, nullptr, &totalBytes);
 
-        D3D12_HEAP_PROPERTIES readHeap = {};
-        readHeap.Type = D3D12_HEAP_TYPE_READBACK;
-
-        D3D12_HEAP_PROPERTIES writeHeap = {};
-        writeHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_HEAP_PROPERTIES readHeap  = { D3D12_HEAP_TYPE_READBACK };
+        D3D12_HEAP_PROPERTIES writeHeap = { D3D12_HEAP_TYPE_UPLOAD };
 
         D3D12_RESOURCE_DESC bufDesc = {};
-        bufDesc.Dimension          = D3D12_RESOURCE_DIMENSION_BUFFER;
-        bufDesc.Width              = totalBytes;
-        bufDesc.Height             = 1;
-        bufDesc.DepthOrArraySize   = 1;
-        bufDesc.MipLevels          = 1;
-        bufDesc.Format             = DXGI_FORMAT_UNKNOWN;
-        bufDesc.SampleDesc.Count   = 1;
-        bufDesc.Layout             = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        bufDesc.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bufDesc.Width            = totalBytes;
+        bufDesc.Height           = 1;
+        bufDesc.DepthOrArraySize = 1;
+        bufDesc.MipLevels        = 1;
+        bufDesc.Format           = DXGI_FORMAT_UNKNOWN;
+        bufDesc.SampleDesc.Count = 1;
+        bufDesc.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 
         if (SUCCEEDED(d3d12Dev->CreateCommittedResource(&readHeap, D3D12_HEAP_FLAG_NONE, &bufDesc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_d3d12ReadbackBuf)))) {
             g_d3d12ReadbackBuf->Map(0, nullptr, reinterpret_cast<void**>(&g_mappedReadPtr));
@@ -341,9 +248,6 @@ static void on_init_swapchain(reshade::api::swapchain* swapchain, bool resize) {
             g_d3d12UploadBuf->Map(0, nullptr, reinterpret_cast<void**>(&g_mappedWritePtr));
         }
     } else {
-        reshade::api::resource backbuffer = swapchain->get_current_back_buffer();
-        reshade::api::resource_desc desc = dev->get_resource_desc(backbuffer);
-
         reshade::api::resource_desc readDesc = desc;
         readDesc.heap  = reshade::api::memory_heap::gpu_to_cpu;
         readDesc.usage = reshade::api::resource_usage::copy_dest;
@@ -358,64 +262,82 @@ static void on_init_swapchain(reshade::api::swapchain* swapchain, bool resize) {
 }
 
 static void process_frame_pixels(const uint8_t* srcPtr, size_t srcPitch, uint8_t* dstPtr, size_t dstPitch) {
-    int totalPixels = 1920 * 1080;
-    size_t rowBytes = 1920 * 4;
+    bool isBGRA = (g_bbFormat == reshade::api::format::b8g8r8a8_unorm ||
+                   g_bbFormat == reshade::api::format::b8g8r8a8_unorm_srgb ||
+                   g_bbFormat == reshade::api::format::b8g8r8x8_unorm ||
+                   g_bbFormat == reshade::api::format::b8g8r8x8_unorm_srgb);
+    int rIdx = isBGRA ? 2 : 0;
+    int gIdx = 1;
+    int bIdx = isBGRA ? 0 : 2;
 
-    if (g_fnPack && g_fnUnpack && fn_cuLaunchKernel) {
-        fn_cudaMemcpy2DAsync(g_dRgbaRaw, rowBytes, srcPtr, srcPitch, rowBytes, 1080, cudaMemcpyHostToDevice, g_cudaStream);
+    uint32_t copyW = (g_bbWidth  < ENGINE_W) ? g_bbWidth  : ENGINE_W;
+    uint32_t copyH = (g_bbHeight < ENGINE_H) ? g_bbHeight : ENGINE_H;
 
-        int threads = 256;
-        int blocks  = (totalPixels + threads - 1) / threads;
-        void* packArgs[] = { &g_dRgbaRaw, &g_dInput, &totalPixels };
-        fn_cuLaunchKernel(g_fnPack, blocks, 1, 1, threads, 1, 1, 0, g_cudaStream, packArgs, nullptr);
+    // 1. Pack actual window pixels into 1x7x1080x1920 FP16 G-Buffer
+    // Channels 0,1,2: RGB [0..1]
+    // Channels 3,4,5: Approximate Normals (0.5, 0.5, 1.0 flat camera-facing normal)
+    // Channel  6:     Luminance / Depth [0..1]
+    uint16_t flatNx = f32_to_f16(0.0f);
+    uint16_t flatNy = f32_to_f16(0.0f);
+    uint16_t flatNz = f32_to_f16(1.0f);
 
-        g_trtContext->enqueueV3(g_cudaStream);
+    for (uint32_t y = 0; y < copyH; ++y) {
+        const uint8_t* row = srcPtr + y * srcPitch;
+        for (uint32_t x = 0; x < copyW; ++x) {
+            int idx = y * ENGINE_W + x;
+            float r = row[x * 4 + rIdx] * (1.0f / 255.0f);
+            float g = row[x * 4 + gIdx] * (1.0f / 255.0f);
+            float b = row[x * 4 + bIdx] * (1.0f / 255.0f);
+            float luma = 0.2126f * r + 0.7152f * g + 0.0722f * b;
 
-        void* unpackArgs[] = { &g_dOutput, &g_dRgbaRaw, &totalPixels };
-        fn_cuLaunchKernel(g_fnUnpack, blocks, 1, 1, threads, 1, 1, 0, g_cudaStream, unpackArgs, nullptr);
-
-        fn_cudaMemcpy2DAsync(dstPtr, dstPitch, g_dRgbaRaw, rowBytes, rowBytes, 1080, cudaMemcpyDeviceToHost, g_cudaStream);
-        fn_cudaStreamSynchronize(g_cudaStream);
-    } else {
-        for (int y = 0; y < 1080; ++y) {
-            const uint8_t* row = srcPtr + y * srcPitch;
-            for (int x = 0; x < 1920; ++x) {
-                int idx = y * 1920 + x;
-                float r = row[x * 4 + 0] * (1.0f / 255.0f);
-                float g = row[x * 4 + 1] * (1.0f / 255.0f);
-                float b = row[x * 4 + 2] * (1.0f / 255.0f);
-                float luma = 0.2126f * r + 0.7152f * g + 0.0722f * b;
-
-                g_cpuGbuf[0 * totalPixels + idx] = cpu_f32_to_f16(r);
-                g_cpuGbuf[1 * totalPixels + idx] = cpu_f32_to_f16(g);
-                g_cpuGbuf[2 * totalPixels + idx] = cpu_f32_to_f16(b);
-                g_cpuGbuf[3 * totalPixels + idx] = cpu_f32_to_f16(r * r);
-                g_cpuGbuf[4 * totalPixels + idx] = cpu_f32_to_f16(g * g);
-                g_cpuGbuf[5 * totalPixels + idx] = cpu_f32_to_f16(b * b);
-                g_cpuGbuf[6 * totalPixels + idx] = cpu_f32_to_f16(luma);
-            }
+            g_cpuGbuf[0 * ENGINE_PIXELS + idx] = f32_to_f16(r);
+            g_cpuGbuf[1 * ENGINE_PIXELS + idx] = f32_to_f16(g);
+            g_cpuGbuf[2 * ENGINE_PIXELS + idx] = f32_to_f16(b);
+            g_cpuGbuf[3 * ENGINE_PIXELS + idx] = flatNx;
+            g_cpuGbuf[4 * ENGINE_PIXELS + idx] = flatNy;
+            g_cpuGbuf[5 * ENGINE_PIXELS + idx] = flatNz;
+            g_cpuGbuf[6 * ENGINE_PIXELS + idx] = f32_to_f16(luma);
         }
+    }
 
-        fn_cudaMemcpyAsync(g_dInput, g_cpuGbuf.data(), totalPixels * 7 * sizeof(uint16_t), cudaMemcpyHostToDevice, g_cudaStream);
-        g_trtContext->enqueueV3(g_cudaStream);
-        fn_cudaMemcpyAsync(g_cpuOut.data(), g_dOutput, totalPixels * 3 * sizeof(uint16_t), cudaMemcpyDeviceToHost, g_cudaStream);
-        fn_cudaStreamSynchronize(g_cudaStream);
+    // 2. Run TensorRT Inference
+    fn_cudaMemcpyAsync(g_dInput, g_cpuGbuf.data(), (size_t)ENGINE_PIXELS * 7 * sizeof(uint16_t), cudaMemcpyHostToDevice, g_cudaStream);
+    bool ok = g_trtContext->enqueueV3(g_cudaStream);
+    fn_cudaMemcpyAsync(g_cpuOut.data(), g_dOutput, (size_t)ENGINE_PIXELS * 3 * sizeof(uint16_t), cudaMemcpyDeviceToHost, g_cudaStream);
+    fn_cudaStreamSynchronize(g_cudaStream);
 
-        for (int y = 0; y < 1080; ++y) {
-            uint8_t* dstRow = dstPtr + y * dstPitch;
-            for (int x = 0; x < 1920; ++x) {
-                int idx = y * 1920 + x;
-                float r = cpu_f16_to_f32(g_cpuOut[0 * totalPixels + idx]);
-                float g = cpu_f16_to_f32(g_cpuOut[1 * totalPixels + idx]);
-                float b = cpu_f16_to_f32(g_cpuOut[2 * totalPixels + idx]);
-                r = r < 0.0f ? 0.0f : (r > 1.0f ? 1.0f : r);
-                g = g < 0.0f ? 0.0f : (g > 1.0f ? 1.0f : g);
-                b = b < 0.0f ? 0.0f : (b > 1.0f ? 1.0f : b);
-                dstRow[x * 4 + 0] = (uint8_t)(r * 255.0f);
-                dstRow[x * 4 + 1] = (uint8_t)(g * 255.0f);
-                dstRow[x * 4 + 2] = (uint8_t)(b * 255.0f);
-                dstRow[x * 4 + 3] = 255;
-            }
+    if (!ok) {
+        // If inference failed, preserve original frame so screen never turns blue
+        for (uint32_t y = 0; y < g_bbHeight; ++y) {
+            std::memcpy(dstPtr + y * dstPitch, srcPtr + y * srcPitch, g_bbWidth * 4);
+        }
+        return;
+    }
+
+    // 3. Unpack rendered_frame [1, 3, 1080, 1920] FP16 back to Game Backbuffer Format
+    for (uint32_t y = 0; y < copyH; ++y) {
+        const uint8_t* srcRow = srcPtr + y * srcPitch;
+        uint8_t*       dstRow = dstPtr + y * dstPitch;
+        for (uint32_t x = 0; x < copyW; ++x) {
+            int idx = y * ENGINE_W + x;
+
+            float nr = f16_to_f32(g_cpuOut[0 * ENGINE_PIXELS + idx]);
+            float ng = f16_to_f32(g_cpuOut[1 * ENGINE_PIXELS + idx]);
+            float nb = f16_to_f32(g_cpuOut[2 * ENGINE_PIXELS + idx]);
+
+            // Reinhard HDR tone-map for values > 1.0 and clamp negative values
+            nr = nr < 0.0f ? 0.0f : (nr / (1.0f + nr) * 1.4f);
+            ng = ng < 0.0f ? 0.0f : (ng / (1.0f + ng) * 1.4f);
+            nb = nb < 0.0f ? 0.0f : (nb / (1.0f + nb) * 1.4f);
+
+            nr = nr > 1.0f ? 1.0f : nr;
+            ng = ng > 1.0f ? 1.0f : ng;
+            nb = nb > 1.0f ? 1.0f : nb;
+
+            dstRow[x * 4 + rIdx] = (uint8_t)(nr * 255.0f + 0.5f);
+            dstRow[x * 4 + gIdx] = (uint8_t)(ng * 255.0f + 0.5f);
+            dstRow[x * 4 + bIdx] = (uint8_t)(nb * 255.0f + 0.5f);
+            dstRow[x * 4 + 3]    = srcRow[x * 4 + 3];
         }
     }
 }
@@ -438,7 +360,6 @@ static void on_present(
         ID3D12GraphicsCommandList* d3d12Cmd = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd->get_native());
         ID3D12Resource* bbRes = reinterpret_cast<ID3D12Resource*>(backbuffer.handle);
 
-        // 1. Transition D3D12 Backbuffer: PRESENT -> COPY_SOURCE
         D3D12_RESOURCE_BARRIER barrier = {};
         barrier.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         barrier.Transition.pResource   = bbRes;
@@ -447,7 +368,6 @@ static void on_present(
         barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
         d3d12Cmd->ResourceBarrier(1, &barrier);
 
-        // 2. Copy Backbuffer Texture -> D3D12 Readback Buffer
         D3D12_TEXTURE_COPY_LOCATION srcLoc = {};
         srcLoc.pResource        = bbRes;
         srcLoc.Type             = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -460,14 +380,11 @@ static void on_present(
 
         d3d12Cmd->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
 
-        // Wait for D3D12 copy to finish
         queue->flush_immediate_command_list();
         queue->wait_idle();
 
-        // 3. Process Frame Through TensorRT SDR2HDR Engine
         process_frame_pixels(g_mappedReadPtr, g_d3d12Footprint.Footprint.RowPitch, g_mappedWritePtr, g_d3d12Footprint.Footprint.RowPitch);
 
-        // 4. Transition Backbuffer: COPY_SOURCE -> COPY_DEST
         cmd = queue->get_immediate_command_list();
         d3d12Cmd = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd->get_native());
 
@@ -475,7 +392,6 @@ static void on_present(
         barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
         d3d12Cmd->ResourceBarrier(1, &barrier);
 
-        // 5. Copy Processed Upload Buffer -> D3D12 Backbuffer Texture
         D3D12_TEXTURE_COPY_LOCATION uploadSrc = {};
         uploadSrc.pResource       = g_d3d12UploadBuf;
         uploadSrc.Type            = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
@@ -488,7 +404,6 @@ static void on_present(
 
         d3d12Cmd->CopyTextureRegion(&bbDst, 0, 0, 0, &uploadSrc, nullptr);
 
-        // 6. Transition Backbuffer: COPY_DEST -> PRESENT
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
         barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
         d3d12Cmd->ResourceBarrier(1, &barrier);
@@ -525,9 +440,9 @@ static void on_destroy_swapchain(reshade::api::swapchain* swapchain, bool resize
     if (g_texRead.handle)   { dev->destroy_resource(g_texRead);  g_texRead  = { 0 }; }
     if (g_texWrite.handle)  { dev->destroy_resource(g_texWrite); g_texWrite = { 0 }; }
     if (fn_cudaFree) {
-        if (g_dRgbaRaw) { fn_cudaFree(g_dRgbaRaw); g_dRgbaRaw = nullptr; }
-        if (g_dInput)   { fn_cudaFree(g_dInput);   g_dInput   = nullptr; }
-        if (g_dOutput)  { fn_cudaFree(g_dOutput);  g_dOutput  = nullptr; }
+        if (g_dInput)  { fn_cudaFree(g_dInput);  g_dInput  = nullptr; }
+        if (g_dAuxIn)  { fn_cudaFree(g_dAuxIn);  g_dAuxIn  = nullptr; }
+        if (g_dOutput) { fn_cudaFree(g_dOutput); g_dOutput = nullptr; }
     }
 }
 
@@ -537,10 +452,8 @@ static void on_destroy_device(reshade::api::device* device) {
     delete g_trtEngine;  g_trtEngine  = nullptr;
     delete g_trtRuntime; g_trtRuntime = nullptr;
     if (fn_cudaStreamDestroy && g_cudaStream) { fn_cudaStreamDestroy(g_cudaStream); g_cudaStream = nullptr; }
-    if (g_hTrt)    { FreeLibrary(g_hTrt);    g_hTrt    = nullptr; }
-    if (g_hCuda)   { FreeLibrary(g_hCuda);   g_hCuda   = nullptr; }
-    if (g_hNvCuda) { FreeLibrary(g_hNvCuda); g_hNvCuda = nullptr; }
-    if (g_hNvrtc)  { FreeLibrary(g_hNvrtc);  g_hNvrtc  = nullptr; }
+    if (g_hTrt)  { FreeLibrary(g_hTrt);  g_hTrt  = nullptr; }
+    if (g_hCuda) { FreeLibrary(g_hCuda); g_hCuda = nullptr; }
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpvReserved) {
