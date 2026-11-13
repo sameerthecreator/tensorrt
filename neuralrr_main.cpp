@@ -45,7 +45,12 @@ static pfn_cudaStreamSynchronize       fn_cudaStreamSynchronize = nullptr;
 static pfn_cudaMemcpyAsync             fn_cudaMemcpyAsync = nullptr;
 static pfn_createInferRuntime_INTERNAL fn_createInferRuntime = nullptr;
 
-static inline uint16_t f32_to_f16(float f) {
+// Fast Lookup Tables so the CPU never does slow float->FP16 math per pixel!
+static uint16_t g_byteToFp16[256];
+static float    g_fp16ToFloat[65536];
+static bool     g_tablesInitialized = false;
+
+static uint16_t calc_f32_to_f16(float f) {
     if (f <= 0.0f) return 0;
     if (f >= 65504.0f) f = 65504.0f;
     uint32_t x;
@@ -58,7 +63,7 @@ static inline uint16_t f32_to_f16(float f) {
     return (uint16_t)(sign | (exp << 10) | mant);
 }
 
-static inline float f16_to_f32(uint16_t h) {
+static float calc_f16_to_f32(uint16_t h) {
     uint32_t sign = (h & 0x8000) << 16;
     uint32_t exp  = (h >> 10) & 0x1f;
     uint32_t mant = h & 0x03ff;
@@ -76,6 +81,17 @@ static inline float f16_to_f32(uint16_t h) {
     return f;
 }
 
+static void init_lookup_tables() {
+    if (g_tablesInitialized) return;
+    for (int i = 0; i < 256; ++i) {
+        g_byteToFp16[i] = calc_f32_to_f16((float)i * (1.0f / 255.0f));
+    }
+    for (int i = 0; i < 65536; ++i) {
+        g_fp16ToFloat[i] = calc_f16_to_f32((uint16_t)i);
+    }
+    g_tablesInitialized = true;
+}
+
 class Logger : public nvinfer1::ILogger {
     void log(Severity severity, const char* msg) noexcept override {}
 } g_logger;
@@ -90,7 +106,6 @@ static constexpr int ENGINE_H = 1080;
 static constexpr int ENGINE_PIXELS = ENGINE_W * ENGINE_H;
 
 static void*                 g_dInput   = nullptr;
-static void*                 g_dAuxIn   = nullptr;
 static void*                 g_dOutput  = nullptr;
 static std::vector<uint16_t> g_cpuGbuf;
 static std::vector<uint16_t> g_cpuOut;
@@ -101,70 +116,13 @@ static D3D12_PLACED_SUBRESOURCE_FOOTPRINT g_d3d12Footprint   = {};
 static uint8_t*                           g_mappedReadPtr    = nullptr;
 static uint8_t*                           g_mappedWritePtr   = nullptr;
 
-static reshade::api::resource g_texRead  = { 0 };
-static reshade::api::resource g_texWrite = { 0 };
-static bool                   g_isD3D12  = false;
-static uint32_t               g_bbWidth  = 1920;
-static uint32_t               g_bbHeight = 1080;
-static reshade::api::format   g_bbFormat = reshade::api::format::r8g8b8a8_unorm;
-
-static inline void decode_pixel(const uint8_t* pixelPtr, reshade::api::format fmt, float& r, float& g, float& b, uint32_t& rawAlpha) {
-    if (fmt == reshade::api::format::r10g10b10a2_unorm || fmt == reshade::api::format::r10g10b10a2_uint) {
-        uint32_t packed = *reinterpret_cast<const uint32_t*>(pixelPtr);
-        r = (float)((packed >>  0) & 0x3FF) * (1.0f / 1023.0f);
-        g = (float)((packed >> 10) & 0x3FF) * (1.0f / 1023.0f);
-        b = (float)((packed >> 20) & 0x3FF) * (1.0f / 1023.0f);
-        rawAlpha = (packed >> 30) & 0x3;
-    } else if (fmt == reshade::api::format::b10g10r10a2_unorm) {
-        uint32_t packed = *reinterpret_cast<const uint32_t*>(pixelPtr);
-        b = (float)((packed >>  0) & 0x3FF) * (1.0f / 1023.0f);
-        g = (float)((packed >> 10) & 0x3FF) * (1.0f / 1023.0f);
-        r = (float)((packed >> 20) & 0x3FF) * (1.0f / 1023.0f);
-        rawAlpha = (packed >> 30) & 0x3;
-    } else if (fmt == reshade::api::format::b8g8r8a8_unorm || fmt == reshade::api::format::b8g8r8a8_unorm_srgb ||
-               fmt == reshade::api::format::b8g8r8x8_unorm || fmt == reshade::api::format::b8g8r8x8_unorm_srgb) {
-        b = pixelPtr[0] * (1.0f / 255.0f);
-        g = pixelPtr[1] * (1.0f / 255.0f);
-        r = pixelPtr[2] * (1.0f / 255.0f);
-        rawAlpha = pixelPtr[3];
-    } else {
-        r = pixelPtr[0] * (1.0f / 255.0f);
-        g = pixelPtr[1] * (1.0f / 255.0f);
-        b = pixelPtr[2] * (1.0f / 255.0f);
-        rawAlpha = pixelPtr[3];
-    }
-}
-
-static inline void encode_pixel(uint8_t* pixelPtr, reshade::api::format fmt, float r, float g, float b, uint32_t rawAlpha) {
-    r = r < 0.0f ? 0.0f : (r > 1.0f ? 1.0f : r);
-    g = g < 0.0f ? 0.0f : (g > 1.0f ? 1.0f : g);
-    b = b < 0.0f ? 0.0f : (b > 1.0f ? 1.0f : b);
-
-    if (fmt == reshade::api::format::r10g10b10a2_unorm || fmt == reshade::api::format::r10g10b10a2_uint) {
-        uint32_t ir = (uint32_t)(r * 1023.0f + 0.5f) & 0x3FF;
-        uint32_t ig = (uint32_t)(g * 1023.0f + 0.5f) & 0x3FF;
-        uint32_t ib = (uint32_t)(b * 1023.0f + 0.5f) & 0x3FF;
-        *reinterpret_cast<uint32_t*>(pixelPtr) = ir | (ig << 10) | (ib << 20) | ((rawAlpha & 0x3) << 30);
-    } else if (fmt == reshade::api::format::b10g10r10a2_unorm) {
-        uint32_t ib = (uint32_t)(b * 1023.0f + 0.5f) & 0x3FF;
-        uint32_t ig = (uint32_t)(g * 1023.0f + 0.5f) & 0x3FF;
-        uint32_t ir = (uint32_t)(r * 1023.0f + 0.5f) & 0x3FF;
-        *reinterpret_cast<uint32_t*>(pixelPtr) = ib | (ig << 10) | (ir << 20) | ((rawAlpha & 0x3) << 30);
-    } else if (fmt == reshade::api::format::b8g8r8a8_unorm || fmt == reshade::api::format::b8g8r8a8_unorm_srgb ||
-               fmt == reshade::api::format::b8g8r8x8_unorm || fmt == reshade::api::format::b8g8r8x8_unorm_srgb) {
-        pixelPtr[0] = (uint8_t)(b * 255.0f + 0.5f);
-        pixelPtr[1] = (uint8_t)(g * 255.0f + 0.5f);
-        pixelPtr[2] = (uint8_t)(r * 255.0f + 0.5f);
-        pixelPtr[3] = (uint8_t)rawAlpha;
-    } else {
-        pixelPtr[0] = (uint8_t)(r * 255.0f + 0.5f);
-        pixelPtr[1] = (uint8_t)(g * 255.0f + 0.5f);
-        pixelPtr[2] = (uint8_t)(b * 255.0f + 0.5f);
-        pixelPtr[3] = (uint8_t)rawAlpha;
-    }
-}
+static bool                 g_isD3D12  = false;
+static uint32_t             g_bbWidth  = 1920;
+static uint32_t             g_bbHeight = 1080;
+static reshade::api::format g_bbFormat = reshade::api::format::r8g8b8a8_unorm;
 
 static bool load_libraries() {
+    init_lookup_tables();
     const char* trtNames[]  = { "nvinfer_11.dll", "nvinfer_10.dll", "nvinfer.dll", "nvinfer_8.dll" };
     const char* cudaNames[] = { "cudart64_13.dll", "cudart64_12.dll", "cudart64_110.dll", "cudart.dll" };
 
@@ -226,44 +184,31 @@ static void on_init_swapchain(reshade::api::swapchain* swapchain, bool resize) {
     g_bbFormat = desc.texture.format;
 
     fn_cudaMalloc(&g_dInput,  (size_t)ENGINE_PIXELS * 7 * sizeof(uint16_t));
-    fn_cudaMalloc(&g_dAuxIn,  (size_t)ENGINE_PIXELS * 7 * sizeof(uint16_t));
     fn_cudaMalloc(&g_dOutput, (size_t)ENGINE_PIXELS * 3 * sizeof(uint16_t));
     if (fn_cudaMemset) {
         fn_cudaMemset(g_dInput,  0, (size_t)ENGINE_PIXELS * 7 * sizeof(uint16_t));
-        fn_cudaMemset(g_dAuxIn,  0, (size_t)ENGINE_PIXELS * 7 * sizeof(uint16_t));
         fn_cudaMemset(g_dOutput, 0, (size_t)ENGINE_PIXELS * 3 * sizeof(uint16_t));
     }
 
     g_cpuGbuf.assign((size_t)ENGINE_PIXELS * 7, 0);
     g_cpuOut.assign((size_t)ENGINE_PIXELS * 3, 0);
 
-    int32_t nbTensors = g_trtEngine->getNbIOTensors();
-    bool boundPrimaryInput = false;
-    for (int32_t i = 0; i < nbTensors; ++i) {
-        const char* name = g_trtEngine->getIOTensorName(i);
-        nvinfer1::TensorIOMode mode = g_trtEngine->getTensorIOMode(name);
-
-        if (mode == nvinfer1::TensorIOMode::kINPUT) {
-            nvinfer1::Dims dims = g_trtEngine->getTensorShape(name);
-            if (dims.nbDims == 4) {
-                nvinfer1::Dims runDims;
-                runDims.nbDims = 4;
-                runDims.d[0] = (dims.d[0] > 0) ? dims.d[0] : 1;
-                runDims.d[1] = (dims.d[1] > 0) ? dims.d[1] : 7;
-                runDims.d[2] = ENGINE_H;
-                runDims.d[3] = ENGINE_W;
-                g_trtContext->setInputShape(name, runDims);
-            }
-            if (std::strcmp(name, "g_buffer") == 0 || !boundPrimaryInput) {
-                g_trtContext->setTensorAddress(name, g_dInput);
-                boundPrimaryInput = true;
-            } else {
-                g_trtContext->setTensorAddress(name, g_dAuxIn);
-            }
-        } else {
-            g_trtContext->setTensorAddress(name, g_dOutput);
-        }
+    // Pre-fill Normal channels (Ch 3, 4 = 0.5, Ch 5 = 1.0) once at startup so we don't waste CPU time every frame!
+    uint16_t half05 = calc_f32_to_f16(0.5f);
+    uint16_t half10 = calc_f32_to_f16(1.0f);
+    for (int i = 0; i < ENGINE_PIXELS; ++i) {
+        g_cpuGbuf[3 * ENGINE_PIXELS + i] = half05;
+        g_cpuGbuf[4 * ENGINE_PIXELS + i] = half05;
+        g_cpuGbuf[5 * ENGINE_PIXELS + i] = half10;
     }
+
+    // Bind directly to "g_buffer" and "rendered_frame" (exact names from your trtexec log)
+    nvinfer1::Dims inDims;
+    inDims.nbDims = 4;
+    inDims.d[0] = 1; inDims.d[1] = 7; inDims.d[2] = 1080; inDims.d[3] = 1920;
+    g_trtContext->setInputShape("g_buffer", inDims);
+    g_trtContext->setTensorAddress("g_buffer", g_dInput);
+    g_trtContext->setTensorAddress("rendered_frame", g_dOutput);
 
     if (g_isD3D12) {
         ID3D12Device* d3d12Dev = reinterpret_cast<ID3D12Device*>(dev->get_native());
@@ -292,96 +237,108 @@ static void on_init_swapchain(reshade::api::swapchain* swapchain, bool resize) {
         if (SUCCEEDED(d3d12Dev->CreateCommittedResource(&writeHeap, D3D12_HEAP_FLAG_NONE, &bufDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_d3d12UploadBuf)))) {
             g_d3d12UploadBuf->Map(0, nullptr, reinterpret_cast<void**>(&g_mappedWritePtr));
         }
-    } else {
-        reshade::api::resource_desc readDesc = desc;
-        readDesc.heap  = reshade::api::memory_heap::gpu_to_cpu;
-        readDesc.usage = reshade::api::resource_usage::copy_dest;
-
-        reshade::api::resource_desc writeDesc = desc;
-        writeDesc.heap  = reshade::api::memory_heap::cpu_to_gpu;
-        writeDesc.usage = reshade::api::resource_usage::copy_source;
-
-        dev->create_resource(readDesc,  nullptr, reshade::api::resource_usage::copy_dest,   &g_texRead);
-        dev->create_resource(writeDesc, nullptr, reshade::api::resource_usage::copy_source, &g_texWrite);
     }
 }
 
 static void process_frame_pixels(const uint8_t* srcPtr, size_t srcPitch, uint8_t* dstPtr, size_t dstPitch) {
-    // Neutral [0..1] normal-map encoding: (0.5, 0.5, 1.0) = flat camera-facing surface
-    uint16_t neutralNormXY = f32_to_f16(0.5f);
-    uint16_t neutralNormZ  = f32_to_f16(1.0f);
+    bool isBGRA = (g_bbFormat == reshade::api::format::b8g8r8a8_unorm ||
+                   g_bbFormat == reshade::api::format::b8g8r8a8_unorm_srgb ||
+                   g_bbFormat == reshade::api::format::b8g8r8x8_unorm ||
+                   g_bbFormat == reshade::api::format::b8g8r8x8_unorm_srgb);
+    int rOff = isBGRA ? 2 : 0;
+    int gOff = 1;
+    int bOff = isBGRA ? 0 : 2;
 
-    // 1. Pack s2r-hdr-4 7-Channel .npz G-Buffer Layout across full 1920x1080 grid
+    uint16_t* ch0 = &g_cpuGbuf[0 * ENGINE_PIXELS];
+    uint16_t* ch1 = &g_cpuGbuf[1 * ENGINE_PIXELS];
+    uint16_t* ch2 = &g_cpuGbuf[2 * ENGINE_PIXELS];
+    uint16_t* ch6 = &g_cpuGbuf[6 * ENGINE_PIXELS];
+
+    // Fast table-driven pack (only updates RGB & Luma channels; Normals Ch 3,4,5 are pre-filled)
     for (int ey = 0; ey < ENGINE_H; ++ey) {
-        uint32_t sy = (uint32_t)((ey * g_bbHeight) / ENGINE_H);
-        if (sy >= g_bbHeight) sy = g_bbHeight - 1;
+        uint32_t sy = (ey * g_bbHeight) / ENGINE_H;
         const uint8_t* row = srcPtr + sy * srcPitch;
+        int rowBase = ey * ENGINE_W;
 
         for (int ex = 0; ex < ENGINE_W; ++ex) {
-            uint32_t sx = (uint32_t)((ex * g_bbWidth) / ENGINE_W);
-            if (sx >= g_bbWidth) sx = g_bbWidth - 1;
+            uint32_t sx = (ex * g_bbWidth) / ENGINE_W;
+            const uint8_t* px = row + sx * 4;
+            uint8_t r8 = px[rOff];
+            uint8_t g8 = px[gOff];
+            uint8_t b8 = px[bOff];
+            uint8_t luma8 = (uint8_t)((r8 * 54 + g8 * 183 + b8 * 19) >> 8);
 
-            float r, g, b;
-            uint32_t a;
-            decode_pixel(row + sx * 4, g_bbFormat, r, g, b, a);
-            float luma = 0.2126f * r + 0.7152f * g + 0.0722f * b;
-
-            int idx = ey * ENGINE_W + ex;
-            g_cpuGbuf[0 * ENGINE_PIXELS + idx] = f32_to_f16(r);
-            g_cpuGbuf[1 * ENGINE_PIXELS + idx] = f32_to_f16(g);
-            g_cpuGbuf[2 * ENGINE_PIXELS + idx] = f32_to_f16(b);
-            g_cpuGbuf[3 * ENGINE_PIXELS + idx] = neutralNormXY;
-            g_cpuGbuf[4 * ENGINE_PIXELS + idx] = neutralNormXY;
-            g_cpuGbuf[5 * ENGINE_PIXELS + idx] = neutralNormZ;
-            g_cpuGbuf[6 * ENGINE_PIXELS + idx] = f32_to_f16(luma);
+            int idx = rowBase + ex;
+            ch0[idx] = g_byteToFp16[r8];
+            ch1[idx] = g_byteToFp16[g8];
+            ch2[idx] = g_byteToFp16[b8];
+            ch6[idx] = g_byteToFp16[luma8];
         }
     }
 
-    // 2. Execute TensorRT Engine
     fn_cudaMemcpyAsync(g_dInput, g_cpuGbuf.data(), (size_t)ENGINE_PIXELS * 7 * sizeof(uint16_t), cudaMemcpyHostToDevice, g_cudaStream);
     bool ok = g_trtContext->enqueueV3(g_cudaStream);
     fn_cudaMemcpyAsync(g_cpuOut.data(), g_dOutput, (size_t)ENGINE_PIXELS * 3 * sizeof(uint16_t), cudaMemcpyDeviceToHost, g_cudaStream);
     fn_cudaStreamSynchronize(g_cudaStream);
 
-    if (!ok) {
-        for (uint32_t y = 0; y < g_bbHeight; ++y) {
-            std::memcpy(dstPtr + y * dstPitch, srcPtr + y * srcPitch, g_bbWidth * 4);
-        }
-        return;
-    }
+    const uint16_t* outR = &g_cpuOut[0 * ENGINE_PIXELS];
+    const uint16_t* outG = &g_cpuOut[1 * ENGINE_PIXELS];
+    const uint16_t* outB = &g_cpuOut[2 * ENGINE_PIXELS];
 
-    // 3. Unpack rendered_frame & Blend HDR Radiance onto Game Backbuffer
+    // Check if the model produced non-zero activations in the center of the screen
+    float centerSample = std::fabs(g_fp16ToFloat[outR[ENGINE_PIXELS / 2]]) +
+                         std::fabs(g_fp16ToFloat[outG[ENGINE_PIXELS / 2]]) +
+                         std::fabs(g_fp16ToFloat[outB[ENGINE_PIXELS / 2]]);
+
     for (uint32_t y = 0; y < g_bbHeight; ++y) {
-        int ey = (int)((y * ENGINE_H) / g_bbHeight);
-        if (ey >= ENGINE_H) ey = ENGINE_H - 1;
-
+        int ey = (y * ENGINE_H) / g_bbHeight;
+        int rowBase = ey * ENGINE_W;
         const uint8_t* srcRow = srcPtr + y * srcPitch;
         uint8_t*       dstRow = dstPtr + y * dstPitch;
 
         for (uint32_t x = 0; x < g_bbWidth; ++x) {
-            int ex = (int)((x * ENGINE_W) / g_bbWidth);
-            if (ex >= ENGINE_W) ex = ENGINE_W - 1;
+            // Draw a 24x24 status indicator square in the top-left corner of the screen:
+            // GREEN = enqueueV3 succeeded & non-zero output | YELLOW = enqueueV3 succeeded but 0 output | RED = enqueueV3 failed
+            if (x < 24 && y < 24) {
+                dstRow[x * 4 + rOff] = ok ? (centerSample > 0.0001f ? 0   : 255) : 255;
+                dstRow[x * 4 + gOff] = ok ? 255 : 0;
+                dstRow[x * 4 + bOff] = 0;
+                dstRow[x * 4 + 3]    = 255;
+                continue;
+            }
 
-            float baseR, baseG, baseB;
-            uint32_t rawA;
-            decode_pixel(srcRow + x * 4, g_bbFormat, baseR, baseG, baseB, rawA);
+            int ex = (x * ENGINE_W) / g_bbWidth;
+            int idx = rowBase + ex;
 
-            int idx = ey * ENGINE_W + ex;
-            float aiR = f16_to_f32(g_cpuOut[0 * ENGINE_PIXELS + idx]);
-            float aiG = f16_to_f32(g_cpuOut[1 * ENGINE_PIXELS + idx]);
-            float aiB = f16_to_f32(g_cpuOut[2 * ENGINE_PIXELS + idx]);
+            float baseR = srcRow[x * 4 + rOff] * (1.0f / 255.0f);
+            float baseG = srcRow[x * 4 + gOff] * (1.0f / 255.0f);
+            float baseB = srcRow[x * 4 + bOff] * (1.0f / 255.0f);
 
-            // Reinhard HDR tone-map on neural output: x / (1 + x)
-            aiR = aiR > 0.0f ? (aiR / (1.0f + aiR)) : 0.0f;
-            aiG = aiG > 0.0f ? (aiG / (1.0f + aiG)) : 0.0f;
-            aiB = aiB > 0.0f ? (aiB / (1.0f + aiB)) : 0.0f;
+            float aiR = std::fabs(g_fp16ToFloat[outR[idx]]);
+            float aiG = std::fabs(g_fp16ToFloat[outG[idx]]);
+            float aiB = std::fabs(g_fp16ToFloat[outB[idx]]);
 
-            // Blend 65% Original SDR + 35% Tone-Mapped Neural HDR so synthetic normals never corrupt base image
-            float finalR = baseR * 0.65f + aiR * 0.35f;
-            float finalG = baseG * 0.65f + aiG * 0.35f;
-            float finalB = baseB * 0.65f + aiB * 0.35f;
+            // Reinhard HDR compression on AI output
+            aiR = aiR / (1.0f + aiR);
+            aiG = aiG / (1.0f + aiG);
+            aiB = aiB / (1.0f + aiB);
 
-            encode_pixel(dstRow + x * 4, g_bbFormat, finalR, finalG, finalB, rawA);
+            // Left half of screen = Original Game | Right half of screen = HDR Enhanced (50% Base + 50% AI HDR + 1.25x contrast)
+            float finalR = baseR, finalG = baseG, finalB = baseB;
+            if (x > (g_bbWidth / 2)) {
+                finalR = baseR * 0.5f + aiR * 0.65f;
+                finalG = baseG * 0.5f + aiG * 0.65f;
+                finalB = baseB * 0.5f + aiB * 0.65f;
+            }
+
+            finalR = finalR > 1.0f ? 1.0f : finalR;
+            finalG = finalG > 1.0f ? 1.0f : finalG;
+            finalB = finalB > 1.0f ? 1.0f : finalB;
+
+            dstRow[x * 4 + rOff] = (uint8_t)(finalR * 255.0f + 0.5f);
+            dstRow[x * 4 + gOff] = (uint8_t)(finalG * 255.0f + 0.5f);
+            dstRow[x * 4 + bOff] = (uint8_t)(finalB * 255.0f + 0.5f);
+            dstRow[x * 4 + 3]    = 255;
         }
     }
 }
@@ -396,7 +353,6 @@ static void on_present(
 {
     if (!g_trtContext) return;
 
-    reshade::api::device* dev = swapchain->get_device();
     reshade::api::command_list* cmd = queue->get_immediate_command_list();
     reshade::api::resource backbuffer = swapchain->get_current_back_buffer();
 
@@ -461,7 +417,6 @@ static void on_destroy_swapchain(reshade::api::swapchain* swapchain, bool resize
     if (g_d3d12UploadBuf)   { g_d3d12UploadBuf->Unmap(0, nullptr);   g_d3d12UploadBuf->Release();   g_d3d12UploadBuf   = nullptr; g_mappedWritePtr = nullptr; }
     if (fn_cudaFree) {
         if (g_dInput)  { fn_cudaFree(g_dInput);  g_dInput  = nullptr; }
-        if (g_dAuxIn)  { fn_cudaFree(g_dAuxIn);  g_dAuxIn  = nullptr; }
         if (g_dOutput) { fn_cudaFree(g_dOutput); g_dOutput = nullptr; }
     }
 }
