@@ -9,13 +9,11 @@
 #include <cstdint>
 #include <cstring>
 #include <cmath>
+#include <algorithm>
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
 
-// ============================================================================
-// 1. DYNAMIC CUDA & TENSORRT FUNCTION POINTERS
-// ============================================================================
 typedef int cudaError_t;
 typedef struct CUstream_st* cudaStream_t;
 
@@ -47,7 +45,6 @@ static pfn_cudaStreamSynchronize       fn_cudaStreamSynchronize = nullptr;
 static pfn_cudaMemcpyAsync             fn_cudaMemcpyAsync = nullptr;
 static pfn_createInferRuntime_INTERNAL fn_createInferRuntime = nullptr;
 
-// Fast IEEE 754 Float32 <-> Float16 conversion
 static inline uint16_t f32_to_f16(float f) {
     uint32_t x;
     std::memcpy(&x, &f, 4);
@@ -68,7 +65,7 @@ static inline float f16_to_f32(uint16_t h) {
         while ((mant & 0x0400) == 0) { mant <<= 1; exp--; }
         exp++; mant &= ~0x0400;
     } else if (exp == 31) {
-        return 0.0f; // Filter out NaN/Inf from FP16 overflow
+        return 0.0f;
     }
     exp = exp - 15 + 127;
     uint32_t x = sign | (exp << 23) | (mant << 13);
@@ -77,17 +74,8 @@ static inline float f16_to_f32(uint16_t h) {
     return f;
 }
 
-// ============================================================================
-// 2. GLOBAL ENGINE & DIRECTX 12 STATE
-// ============================================================================
 class Logger : public nvinfer1::ILogger {
-    void log(Severity severity, const char* msg) noexcept override {
-        if (severity <= Severity::kINFO) {
-            OutputDebugStringA("[NeuralRR] ");
-            OutputDebugStringA(msg);
-            OutputDebugStringA("\n");
-        }
-    }
+    void log(Severity severity, const char* msg) noexcept override {}
 } g_logger;
 
 static nvinfer1::IRuntime*          g_trtRuntime = nullptr;
@@ -99,9 +87,9 @@ static constexpr int ENGINE_W = 1920;
 static constexpr int ENGINE_H = 1080;
 static constexpr int ENGINE_PIXELS = ENGINE_W * ENGINE_H;
 
-static void*                 g_dInput   = nullptr; // g_buffer (1x7x1080x1920 FP16)
-static void*                 g_dAuxIn   = nullptr; // Extra buffer in case model has a 2nd input tensor
-static void*                 g_dOutput  = nullptr; // rendered_frame (1x3x1080x1920 FP16)
+static void*                 g_dInput   = nullptr;
+static void*                 g_dAuxIn   = nullptr;
+static void*                 g_dOutput  = nullptr;
 static std::vector<uint16_t> g_cpuGbuf;
 static std::vector<uint16_t> g_cpuOut;
 
@@ -117,6 +105,63 @@ static bool                   g_isD3D12  = false;
 static uint32_t               g_bbWidth  = 1920;
 static uint32_t               g_bbHeight = 1080;
 static reshade::api::format   g_bbFormat = reshade::api::format::r8g8b8a8_unorm;
+
+// Decode pixel from ANY DirectX 12 / 11 Backbuffer Format (8-bit RGBA, 8-bit BGRA, or 10-bit R10G10B10A2!)
+static inline void decode_pixel(const uint8_t* pixelPtr, reshade::api::format fmt, float& r, float& g, float& b, uint32_t& rawAlpha) {
+    if (fmt == reshade::api::format::r10g10b10a2_unorm || fmt == reshade::api::format::r10g10b10a2_uint) {
+        uint32_t packed = *reinterpret_cast<const uint32_t*>(pixelPtr);
+        r = (float)((packed >>  0) & 0x3FF) * (1.0f / 1023.0f);
+        g = (float)((packed >> 10) & 0x3FF) * (1.0f / 1023.0f);
+        b = (float)((packed >> 20) & 0x3FF) * (1.0f / 1023.0f);
+        rawAlpha = (packed >> 30) & 0x3;
+    } else if (fmt == reshade::api::format::b10g10r10a2_unorm) {
+        uint32_t packed = *reinterpret_cast<const uint32_t*>(pixelPtr);
+        b = (float)((packed >>  0) & 0x3FF) * (1.0f / 1023.0f);
+        g = (float)((packed >> 10) & 0x3FF) * (1.0f / 1023.0f);
+        r = (float)((packed >> 20) & 0x3FF) * (1.0f / 1023.0f);
+        rawAlpha = (packed >> 30) & 0x3;
+    } else if (fmt == reshade::api::format::b8g8r8a8_unorm || fmt == reshade::api::format::b8g8r8a8_unorm_srgb ||
+               fmt == reshade::api::format::b8g8r8x8_unorm || fmt == reshade::api::format::b8g8r8x8_unorm_srgb) {
+        b = pixelPtr[0] * (1.0f / 255.0f);
+        g = pixelPtr[1] * (1.0f / 255.0f);
+        r = pixelPtr[2] * (1.0f / 255.0f);
+        rawAlpha = pixelPtr[3];
+    } else {
+        r = pixelPtr[0] * (1.0f / 255.0f);
+        g = pixelPtr[1] * (1.0f / 255.0f);
+        b = pixelPtr[2] * (1.0f / 255.0f);
+        rawAlpha = pixelPtr[3];
+    }
+}
+
+static inline void encode_pixel(uint8_t* pixelPtr, reshade::api::format fmt, float r, float g, float b, uint32_t rawAlpha) {
+    r = r < 0.0f ? 0.0f : (r > 1.0f ? 1.0f : r);
+    g = g < 0.0f ? 0.0f : (g > 1.0f ? 1.0f : g);
+    b = b < 0.0f ? 0.0f : (b > 1.0f ? 1.0f : b);
+
+    if (fmt == reshade::api::format::r10g10b10a2_unorm || fmt == reshade::api::format::r10g10b10a2_uint) {
+        uint32_t ir = (uint32_t)(r * 1023.0f + 0.5f) & 0x3FF;
+        uint32_t ig = (uint32_t)(g * 1023.0f + 0.5f) & 0x3FF;
+        uint32_t ib = (uint32_t)(b * 1023.0f + 0.5f) & 0x3FF;
+        *reinterpret_cast<uint32_t*>(pixelPtr) = ir | (ig << 10) | (ib << 20) | ((rawAlpha & 0x3) << 30);
+    } else if (fmt == reshade::api::format::b10g10r10a2_unorm) {
+        uint32_t ib = (uint32_t)(b * 1023.0f + 0.5f) & 0x3FF;
+        uint32_t ig = (uint32_t)(g * 1023.0f + 0.5f) & 0x3FF;
+        uint32_t ir = (uint32_t)(r * 1023.0f + 0.5f) & 0x3FF;
+        *reinterpret_cast<uint32_t*>(pixelPtr) = ib | (ig << 10) | (ir << 20) | ((rawAlpha & 0x3) << 30);
+    } else if (fmt == reshade::api::format::b8g8r8a8_unorm || fmt == reshade::api::format::b8g8r8a8_unorm_srgb ||
+               fmt == reshade::api::format::b8g8r8x8_unorm || fmt == reshade::api::format::b8g8r8x8_unorm_srgb) {
+        pixelPtr[0] = (uint8_t)(b * 255.0f + 0.5f);
+        pixelPtr[1] = (uint8_t)(g * 255.0f + 0.5f);
+        pixelPtr[2] = (uint8_t)(r * 255.0f + 0.5f);
+        pixelPtr[3] = (uint8_t)rawAlpha;
+    } else {
+        pixelPtr[0] = (uint8_t)(r * 255.0f + 0.5f);
+        pixelPtr[1] = (uint8_t)(g * 255.0f + 0.5f);
+        pixelPtr[2] = (uint8_t)(b * 255.0f + 0.5f);
+        pixelPtr[3] = (uint8_t)rawAlpha;
+    }
+}
 
 static bool load_libraries() {
     const char* trtNames[]  = { "nvinfer_11.dll", "nvinfer_10.dll", "nvinfer.dll", "nvinfer_8.dll" };
@@ -191,7 +236,6 @@ static void on_init_swapchain(reshade::api::swapchain* swapchain, bool resize) {
     g_cpuGbuf.assign((size_t)ENGINE_PIXELS * 7, 0);
     g_cpuOut.assign((size_t)ENGINE_PIXELS * 3, 0);
 
-    // Fix Bug 1: Bind all inputs and outputs by exact name/role (handles 2-input + 1-output models!)
     int32_t nbTensors = g_trtEngine->getNbIOTensors();
     bool boundPrimaryInput = false;
     for (int32_t i = 0; i < nbTensors; ++i) {
@@ -262,82 +306,67 @@ static void on_init_swapchain(reshade::api::swapchain* swapchain, bool resize) {
 }
 
 static void process_frame_pixels(const uint8_t* srcPtr, size_t srcPitch, uint8_t* dstPtr, size_t dstPitch) {
-    bool isBGRA = (g_bbFormat == reshade::api::format::b8g8r8a8_unorm ||
-                   g_bbFormat == reshade::api::format::b8g8r8a8_unorm_srgb ||
-                   g_bbFormat == reshade::api::format::b8g8r8x8_unorm ||
-                   g_bbFormat == reshade::api::format::b8g8r8x8_unorm_srgb);
-    int rIdx = isBGRA ? 2 : 0;
-    int gIdx = 1;
-    int bIdx = isBGRA ? 0 : 2;
-
     uint32_t copyW = (g_bbWidth  < ENGINE_W) ? g_bbWidth  : ENGINE_W;
     uint32_t copyH = (g_bbHeight < ENGINE_H) ? g_bbHeight : ENGINE_H;
 
-    // 1. Pack actual window pixels into 1x7x1080x1920 FP16 G-Buffer
-    // Channels 0,1,2: RGB [0..1]
-    // Channels 3,4,5: Approximate Normals (0.5, 0.5, 1.0 flat camera-facing normal)
-    // Channel  6:     Luminance / Depth [0..1]
-    uint16_t flatNx = f32_to_f16(0.0f);
-    uint16_t flatNy = f32_to_f16(0.0f);
-    uint16_t flatNz = f32_to_f16(1.0f);
+    uint16_t halfZero = f32_to_f16(0.0f);
+    uint16_t halfOne  = f32_to_f16(1.0f);
 
     for (uint32_t y = 0; y < copyH; ++y) {
         const uint8_t* row = srcPtr + y * srcPitch;
         for (uint32_t x = 0; x < copyW; ++x) {
-            int idx = y * ENGINE_W + x;
-            float r = row[x * 4 + rIdx] * (1.0f / 255.0f);
-            float g = row[x * 4 + gIdx] * (1.0f / 255.0f);
-            float b = row[x * 4 + bIdx] * (1.0f / 255.0f);
+            float r, g, b;
+            uint32_t a;
+            decode_pixel(row + x * 4, g_bbFormat, r, g, b, a);
             float luma = 0.2126f * r + 0.7152f * g + 0.0722f * b;
 
+            int idx = y * ENGINE_W + x;
             g_cpuGbuf[0 * ENGINE_PIXELS + idx] = f32_to_f16(r);
             g_cpuGbuf[1 * ENGINE_PIXELS + idx] = f32_to_f16(g);
             g_cpuGbuf[2 * ENGINE_PIXELS + idx] = f32_to_f16(b);
-            g_cpuGbuf[3 * ENGINE_PIXELS + idx] = flatNx;
-            g_cpuGbuf[4 * ENGINE_PIXELS + idx] = flatNy;
-            g_cpuGbuf[5 * ENGINE_PIXELS + idx] = flatNz;
+            g_cpuGbuf[3 * ENGINE_PIXELS + idx] = halfZero;
+            g_cpuGbuf[4 * ENGINE_PIXELS + idx] = halfZero;
+            g_cpuGbuf[5 * ENGINE_PIXELS + idx] = halfOne;
             g_cpuGbuf[6 * ENGINE_PIXELS + idx] = f32_to_f16(luma);
         }
     }
 
-    // 2. Run TensorRT Inference
     fn_cudaMemcpyAsync(g_dInput, g_cpuGbuf.data(), (size_t)ENGINE_PIXELS * 7 * sizeof(uint16_t), cudaMemcpyHostToDevice, g_cudaStream);
     bool ok = g_trtContext->enqueueV3(g_cudaStream);
     fn_cudaMemcpyAsync(g_cpuOut.data(), g_dOutput, (size_t)ENGINE_PIXELS * 3 * sizeof(uint16_t), cudaMemcpyDeviceToHost, g_cudaStream);
     fn_cudaStreamSynchronize(g_cudaStream);
 
     if (!ok) {
-        // If inference failed, preserve original frame so screen never turns blue
         for (uint32_t y = 0; y < g_bbHeight; ++y) {
             std::memcpy(dstPtr + y * dstPitch, srcPtr + y * srcPitch, g_bbWidth * 4);
         }
         return;
     }
 
-    // 3. Unpack rendered_frame [1, 3, 1080, 1920] FP16 back to Game Backbuffer Format
+    // Blend the Neural HDR prediction onto the base SDR image so base colours stay intact
     for (uint32_t y = 0; y < copyH; ++y) {
         const uint8_t* srcRow = srcPtr + y * srcPitch;
         uint8_t*       dstRow = dstPtr + y * dstPitch;
         for (uint32_t x = 0; x < copyW; ++x) {
+            float baseR, baseG, baseB;
+            uint32_t rawA;
+            decode_pixel(srcRow + x * 4, g_bbFormat, baseR, baseG, baseB, rawA);
+
             int idx = y * ENGINE_W + x;
+            float aiR = f16_to_f32(g_cpuOut[0 * ENGINE_PIXELS + idx]);
+            float aiG = f16_to_f32(g_cpuOut[1 * ENGINE_PIXELS + idx]);
+            float aiB = f16_to_f32(g_cpuOut[2 * ENGINE_PIXELS + idx]);
 
-            float nr = f16_to_f32(g_cpuOut[0 * ENGINE_PIXELS + idx]);
-            float ng = f16_to_f32(g_cpuOut[1 * ENGINE_PIXELS + idx]);
-            float nb = f16_to_f32(g_cpuOut[2 * ENGINE_PIXELS + idx]);
+            // Soft-clamp AI output to [-0.5, 1.5] and blend with base SDR frame (75% Base + 25% Neural HDR)
+            aiR = std::tanh(aiR);
+            aiG = std::tanh(aiG);
+            aiB = std::tanh(aiB);
 
-            // Reinhard HDR tone-map for values > 1.0 and clamp negative values
-            nr = nr < 0.0f ? 0.0f : (nr / (1.0f + nr) * 1.4f);
-            ng = ng < 0.0f ? 0.0f : (ng / (1.0f + ng) * 1.4f);
-            nb = nb < 0.0f ? 0.0f : (nb / (1.0f + nb) * 1.4f);
+            float finalR = baseR * 0.75f + std::max(0.0f, aiR) * 0.35f;
+            float finalG = baseG * 0.75f + std::max(0.0f, aiG) * 0.35f;
+            float finalB = baseB * 0.75f + std::max(0.0f, aiB) * 0.35f;
 
-            nr = nr > 1.0f ? 1.0f : nr;
-            ng = ng > 1.0f ? 1.0f : ng;
-            nb = nb > 1.0f ? 1.0f : nb;
-
-            dstRow[x * 4 + rIdx] = (uint8_t)(nr * 255.0f + 0.5f);
-            dstRow[x * 4 + gIdx] = (uint8_t)(ng * 255.0f + 0.5f);
-            dstRow[x * 4 + bIdx] = (uint8_t)(nb * 255.0f + 0.5f);
-            dstRow[x * 4 + 3]    = srcRow[x * 4 + 3];
+            encode_pixel(dstRow + x * 4, g_bbFormat, finalR, finalG, finalB, rawA);
         }
     }
 }
@@ -410,35 +439,11 @@ static void on_present(
 
         queue->flush_immediate_command_list();
     }
-    else if (g_texRead.handle && g_texWrite.handle) {
-        cmd->barrier(backbuffer, reshade::api::resource_usage::present, reshade::api::resource_usage::copy_source);
-        cmd->copy_resource(backbuffer, g_texRead);
-        cmd->barrier(backbuffer, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::present);
-        queue->flush_immediate_command_list();
-        queue->wait_idle();
-
-        reshade::api::subresource_data mapIn = {}, mapOut = {};
-        if (dev->map_texture_region(g_texRead, 0, nullptr, reshade::api::map_access::read_only, &mapIn)) {
-            if (dev->map_texture_region(g_texWrite, 0, nullptr, reshade::api::map_access::write_only, &mapOut)) {
-                process_frame_pixels(static_cast<const uint8_t*>(mapIn.data), mapIn.row_pitch, static_cast<uint8_t*>(mapOut.data), mapOut.row_pitch);
-                dev->unmap_texture_region(g_texWrite, 0);
-            }
-            dev->unmap_texture_region(g_texRead, 0);
-        }
-
-        cmd->barrier(backbuffer, reshade::api::resource_usage::present, reshade::api::resource_usage::copy_dest);
-        cmd->copy_resource(g_texWrite, backbuffer);
-        cmd->barrier(backbuffer, reshade::api::resource_usage::copy_dest, reshade::api::resource_usage::present);
-        queue->flush_immediate_command_list();
-    }
 }
 
 static void on_destroy_swapchain(reshade::api::swapchain* swapchain, bool resize) {
-    reshade::api::device* dev = swapchain->get_device();
     if (g_d3d12ReadbackBuf) { g_d3d12ReadbackBuf->Unmap(0, nullptr); g_d3d12ReadbackBuf->Release(); g_d3d12ReadbackBuf = nullptr; g_mappedReadPtr = nullptr; }
     if (g_d3d12UploadBuf)   { g_d3d12UploadBuf->Unmap(0, nullptr);   g_d3d12UploadBuf->Release();   g_d3d12UploadBuf   = nullptr; g_mappedWritePtr = nullptr; }
-    if (g_texRead.handle)   { dev->destroy_resource(g_texRead);  g_texRead  = { 0 }; }
-    if (g_texWrite.handle)  { dev->destroy_resource(g_texWrite); g_texWrite = { 0 }; }
     if (fn_cudaFree) {
         if (g_dInput)  { fn_cudaFree(g_dInput);  g_dInput  = nullptr; }
         if (g_dAuxIn)  { fn_cudaFree(g_dAuxIn);  g_dAuxIn  = nullptr; }
