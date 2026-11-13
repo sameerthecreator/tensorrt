@@ -97,10 +97,10 @@ extern "C" __global__ void pack_sdr2hdr_gbuffer(
     if (idx >= total_pixels) return;
 
     int rgba_idx = idx * 4;
-    // DX12 backbuffer is BGRA format -> flip indices 0 and 2 to get correct RGB
-    float b = (float)rgba_in[rgba_idx + 0] * (1.0f / 255.0f);
-    float g = (float)rgba_in[rgba_idx + 1] * (1.0f / 255.0f);
-    float r = (float)rgba_in[rgba_idx + 2] * (1.0f / 255.0f);
+    // Map [0, 255] to [-1, 1] range required by PyTorch HDR models
+    float r = ((float)rgba_in[rgba_idx + 2] * (1.0f / 255.0f)) * 2.0f - 1.0f;
+    float g = ((float)rgba_in[rgba_idx + 1] * (1.0f / 255.0f)) * 2.0f - 1.0f;
+    float b = ((float)rgba_in[rgba_idx + 0] * (1.0f / 255.0f)) * 2.0f - 1.0f;
     float luma = 0.2126f * r + 0.7152f * g + 0.0722f * b;
 
     gbuf_out[0 * total_pixels + idx] = float_to_fp16(r);
@@ -120,16 +120,16 @@ extern "C" __global__ void unpack_hdr_to_rgba(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total_pixels) return;
 
-    float r = fp16_to_float(hdr_in[0 * total_pixels + idx]);
-    float g = fp16_to_float(hdr_in[1 * total_pixels + idx]);
-    float b = fp16_to_float(hdr_in[2 * total_pixels + idx]);
+    // Convert model output from [-1, 1] back to [0, 1]
+    float r = (fp16_to_float(hdr_in[0 * total_pixels + idx]) + 1.0f) * 0.5f;
+    float g = (fp16_to_float(hdr_in[1 * total_pixels + idx]) + 1.0f) * 0.5f;
+    float b = (fp16_to_float(hdr_in[2 * total_pixels + idx]) + 1.0f) * 0.5f;
 
     r = r < 0.0f ? 0.0f : (r > 1.0f ? 1.0f : r);
     g = g < 0.0f ? 0.0f : (g > 1.0f ? 1.0f : g);
     b = b < 0.0f ? 0.0f : (b > 1.0f ? 1.0f : b);
 
     int rgba_idx = idx * 4;
-    // Swap output to DX12 BGRA order
     rgba_out[rgba_idx + 0] = (unsigned char)(b * 255.0f + 0.5f);
     rgba_out[rgba_idx + 1] = (unsigned char)(g * 255.0f + 0.5f);
     rgba_out[rgba_idx + 2] = (unsigned char)(r * 255.0f + 0.5f);
