@@ -1,4 +1,5 @@
 #define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 #include <windows.h>
 #include <d3d11.h>
 #include <d3d12.h>
@@ -9,7 +10,6 @@
 #include <cstdint>
 #include <cstring>
 #include <cmath>
-#include <algorithm>
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -46,6 +46,8 @@ static pfn_cudaMemcpyAsync             fn_cudaMemcpyAsync = nullptr;
 static pfn_createInferRuntime_INTERNAL fn_createInferRuntime = nullptr;
 
 static inline uint16_t f32_to_f16(float f) {
+    if (f <= 0.0f) return 0;
+    if (f >= 65504.0f) f = 65504.0f;
     uint32_t x;
     std::memcpy(&x, &f, 4);
     uint32_t sign = (x >> 16) & 0x8000;
@@ -106,7 +108,6 @@ static uint32_t               g_bbWidth  = 1920;
 static uint32_t               g_bbHeight = 1080;
 static reshade::api::format   g_bbFormat = reshade::api::format::r8g8b8a8_unorm;
 
-// Decode pixel from ANY DirectX 12 / 11 Backbuffer Format (8-bit RGBA, 8-bit BGRA, or 10-bit R10G10B10A2!)
 static inline void decode_pixel(const uint8_t* pixelPtr, reshade::api::format fmt, float& r, float& g, float& b, uint32_t& rawAlpha) {
     if (fmt == reshade::api::format::r10g10b10a2_unorm || fmt == reshade::api::format::r10g10b10a2_uint) {
         uint32_t packed = *reinterpret_cast<const uint32_t*>(pixelPtr);
@@ -306,31 +307,37 @@ static void on_init_swapchain(reshade::api::swapchain* swapchain, bool resize) {
 }
 
 static void process_frame_pixels(const uint8_t* srcPtr, size_t srcPitch, uint8_t* dstPtr, size_t dstPitch) {
-    uint32_t copyW = (g_bbWidth  < ENGINE_W) ? g_bbWidth  : ENGINE_W;
-    uint32_t copyH = (g_bbHeight < ENGINE_H) ? g_bbHeight : ENGINE_H;
+    // Neutral [0..1] normal-map encoding: (0.5, 0.5, 1.0) = flat camera-facing surface
+    uint16_t neutralNormXY = f32_to_f16(0.5f);
+    uint16_t neutralNormZ  = f32_to_f16(1.0f);
 
-    uint16_t halfZero = f32_to_f16(0.0f);
-    uint16_t halfOne  = f32_to_f16(1.0f);
+    // 1. Pack s2r-hdr-4 7-Channel .npz G-Buffer Layout across full 1920x1080 grid
+    for (int ey = 0; ey < ENGINE_H; ++ey) {
+        uint32_t sy = (uint32_t)((ey * g_bbHeight) / ENGINE_H);
+        if (sy >= g_bbHeight) sy = g_bbHeight - 1;
+        const uint8_t* row = srcPtr + sy * srcPitch;
 
-    for (uint32_t y = 0; y < copyH; ++y) {
-        const uint8_t* row = srcPtr + y * srcPitch;
-        for (uint32_t x = 0; x < copyW; ++x) {
+        for (int ex = 0; ex < ENGINE_W; ++ex) {
+            uint32_t sx = (uint32_t)((ex * g_bbWidth) / ENGINE_W);
+            if (sx >= g_bbWidth) sx = g_bbWidth - 1;
+
             float r, g, b;
             uint32_t a;
-            decode_pixel(row + x * 4, g_bbFormat, r, g, b, a);
+            decode_pixel(row + sx * 4, g_bbFormat, r, g, b, a);
             float luma = 0.2126f * r + 0.7152f * g + 0.0722f * b;
 
-            int idx = y * ENGINE_W + x;
+            int idx = ey * ENGINE_W + ex;
             g_cpuGbuf[0 * ENGINE_PIXELS + idx] = f32_to_f16(r);
             g_cpuGbuf[1 * ENGINE_PIXELS + idx] = f32_to_f16(g);
             g_cpuGbuf[2 * ENGINE_PIXELS + idx] = f32_to_f16(b);
-            g_cpuGbuf[3 * ENGINE_PIXELS + idx] = halfZero;
-            g_cpuGbuf[4 * ENGINE_PIXELS + idx] = halfZero;
-            g_cpuGbuf[5 * ENGINE_PIXELS + idx] = halfOne;
+            g_cpuGbuf[3 * ENGINE_PIXELS + idx] = neutralNormXY;
+            g_cpuGbuf[4 * ENGINE_PIXELS + idx] = neutralNormXY;
+            g_cpuGbuf[5 * ENGINE_PIXELS + idx] = neutralNormZ;
             g_cpuGbuf[6 * ENGINE_PIXELS + idx] = f32_to_f16(luma);
         }
     }
 
+    // 2. Execute TensorRT Engine
     fn_cudaMemcpyAsync(g_dInput, g_cpuGbuf.data(), (size_t)ENGINE_PIXELS * 7 * sizeof(uint16_t), cudaMemcpyHostToDevice, g_cudaStream);
     bool ok = g_trtContext->enqueueV3(g_cudaStream);
     fn_cudaMemcpyAsync(g_cpuOut.data(), g_dOutput, (size_t)ENGINE_PIXELS * 3 * sizeof(uint16_t), cudaMemcpyDeviceToHost, g_cudaStream);
@@ -343,28 +350,36 @@ static void process_frame_pixels(const uint8_t* srcPtr, size_t srcPitch, uint8_t
         return;
     }
 
-    // Blend the Neural HDR prediction onto the base SDR image so base colours stay intact
-    for (uint32_t y = 0; y < copyH; ++y) {
+    // 3. Unpack rendered_frame & Blend HDR Radiance onto Game Backbuffer
+    for (uint32_t y = 0; y < g_bbHeight; ++y) {
+        int ey = (int)((y * ENGINE_H) / g_bbHeight);
+        if (ey >= ENGINE_H) ey = ENGINE_H - 1;
+
         const uint8_t* srcRow = srcPtr + y * srcPitch;
         uint8_t*       dstRow = dstPtr + y * dstPitch;
-        for (uint32_t x = 0; x < copyW; ++x) {
+
+        for (uint32_t x = 0; x < g_bbWidth; ++x) {
+            int ex = (int)((x * ENGINE_W) / g_bbWidth);
+            if (ex >= ENGINE_W) ex = ENGINE_W - 1;
+
             float baseR, baseG, baseB;
             uint32_t rawA;
             decode_pixel(srcRow + x * 4, g_bbFormat, baseR, baseG, baseB, rawA);
 
-            int idx = y * ENGINE_W + x;
+            int idx = ey * ENGINE_W + ex;
             float aiR = f16_to_f32(g_cpuOut[0 * ENGINE_PIXELS + idx]);
             float aiG = f16_to_f32(g_cpuOut[1 * ENGINE_PIXELS + idx]);
             float aiB = f16_to_f32(g_cpuOut[2 * ENGINE_PIXELS + idx]);
 
-            // Soft-clamp AI output to [-0.5, 1.5] and blend with base SDR frame (75% Base + 25% Neural HDR)
-            aiR = std::tanh(aiR);
-            aiG = std::tanh(aiG);
-            aiB = std::tanh(aiB);
+            // Reinhard HDR tone-map on neural output: x / (1 + x)
+            aiR = aiR > 0.0f ? (aiR / (1.0f + aiR)) : 0.0f;
+            aiG = aiG > 0.0f ? (aiG / (1.0f + aiG)) : 0.0f;
+            aiB = aiB > 0.0f ? (aiB / (1.0f + aiB)) : 0.0f;
 
-            float finalR = baseR * 0.75f + std::max(0.0f, aiR) * 0.35f;
-            float finalG = baseG * 0.75f + std::max(0.0f, aiG) * 0.35f;
-            float finalB = baseB * 0.75f + std::max(0.0f, aiB) * 0.35f;
+            // Blend 65% Original SDR + 35% Tone-Mapped Neural HDR so synthetic normals never corrupt base image
+            float finalR = baseR * 0.65f + aiR * 0.35f;
+            float finalG = baseG * 0.65f + aiG * 0.35f;
+            float finalB = baseB * 0.65f + aiB * 0.35f;
 
             encode_pixel(dstRow + x * 4, g_bbFormat, finalR, finalG, finalB, rawA);
         }
